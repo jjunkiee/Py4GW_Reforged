@@ -238,6 +238,16 @@ class CombatClass:
             GLOBAL_CACHE.Skill.GetID("Dwarven_Stability"),
             GLOBAL_CACHE.Skill.GetID("Feel_No_Pain")
         ]
+        # Alcohol skills that still pay off sober: drinking is preferred, but a dry
+        # inventory must not suppress the cast. Dwarven Stability extends stances
+        # unconditionally; only its knockdown immunity requires drunk-on-activation.
+        self.alcohol_optional_skills: set[int] = {
+            skill_id
+            for skill_id in (
+                GLOBAL_CACHE.Skill.GetID("Dwarven_Stability"),
+            )
+            if skill_id
+        }
         self._next_alcohol_recheck_ms: int = 0
         self._alcohol_drink_pending: bool = False
         self._alcohol_drink_attempts: int = 0
@@ -2156,9 +2166,18 @@ class CombatClass:
                     self.ResetSkillPointer()
                     return False
 
+                if skill_id not in self.alcohol_optional_skills:
+                    PySystem.Console.Log(
+                        "HeroAI",
+                        f"Skipping alcohol skill {skill_id}: drunk level {drunk_level} is below 2 and no alcohol was consumed",
+                        PySystem.Console.MessageType.Debug,
+                    )
+                    self.ResetSkillPointer()
+                    return False
+
                 PySystem.Console.Log(
                     "HeroAI",
-                    f"Casting alcohol skill {skill_id} while sober",
+                    f"Casting alcohol skill {skill_id} sober: drunk level {drunk_level} and no alcohol available",
                     PySystem.Console.MessageType.Debug,
                 )
             else:
