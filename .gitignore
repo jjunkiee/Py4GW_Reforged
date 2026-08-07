@@ -278,3 +278,19 @@ Py4GW_Reforged_Launcher/*.exe
 # store) -- not meant for the eventual PR to Apo, just internal working notes
 Py4GW_Reforged_Launcher/dev_notes/
 Py4GW.dll
+.claude/skills/py4gw-bridge-mcp/SKILL.md
+.claude/skills/py4gw-bridge-mcp/agents/openai.yaml
+.claude/skills/py4gw-change-verification/SKILL.md
+.claude/skills/py4gw-change-verification/agents/openai.yaml
+.claude/skills/py4gw-docs-navigation/SKILL.md
+.claude/skills/py4gw-docs-navigation/agents/openai.yaml
+.claude/skills/py4gw-native-migration/SKILL.md
+.claude/skills/py4gw-native-migration/agents/openai.yaml
+.claude/skills/py4gw-re-methodology/SKILL.md
+.claude/skills/py4gw-re-methodology/agents/openai.yaml
+.claude/skills/py4gw-runtime-investigation/SKILL.md
+.claude/skills/py4gw-runtime-investigation/agents/openai.yaml
+.claude/skills/py4gw-task-guidance/SKILL.md
+.claude/skills/py4gw-task-guidance/agents/openai.yaml
+.claude/skills/py4gw-ui-imgui/SKILL.md
+.claude/skills/py4gw-ui-imgui/agents/openai.yaml
