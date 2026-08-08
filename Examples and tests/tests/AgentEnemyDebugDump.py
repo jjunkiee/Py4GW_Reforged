@@ -1047,104 +1047,16 @@ def dump_enemy_array() -> None:
         ConsoleLog(MODULE_NAME, _format_agent(agent_id), Console.MessageType.Debug)
 
 
-# region energy deficit view
-
-# Fallback only. The live threshold is read from the ledger below, so this view
-# cannot drift from the gate it claims to describe -- it is used solely when the
-# ledger will not import, at which point the panel has nothing to show anyway.
-ANEURYSM_MIN_DEFICIT_FALLBACK = 15.0
-
-_ENERGY_LEDGER = None
-_ENERGY_LEDGER_RESOLVED = False
-
-
-def _energy_ledger():
-    """The shared deficit ledger, or None if it could not be imported.
-
-    Resolved once and cached. This view deliberately reads the *same* ledger
-    the Aneurysm gate reads rather than recomputing an estimate of its own --
-    a debug view that measures something adjacent to the real thing is worse
-    than no debug view, because it lies with confidence.
-    """
-    global _ENERGY_LEDGER, _ENERGY_LEDGER_RESOLVED
-
-    if not _ENERGY_LEDGER_RESOLVED:
-        _ENERGY_LEDGER_RESOLVED = True
-        try:
-            from Py4GWCoreLib.Builds.Skills import _energy_denial
-
-            _ENERGY_LEDGER = _energy_denial
-        except Exception:
-            _ENERGY_LEDGER = None
-    return _ENERGY_LEDGER
-
-
-def _draw_energy_deficit_panel() -> None:
-    """Live per-frame view of the estimated Energy deficit driving Aneurysm."""
-    PyImGui.separator()
-
-    ledger = _energy_ledger()
-    if ledger is None:
-        PyImGui.text("Estimated Energy deficit")
-        PyImGui.text("Ledger unavailable: Py4GWCoreLib.Builds.Skills._energy_denial did not import.")
-        return
-
-    threshold = float(getattr(ledger, "ANEURYSM_DEFAULT_MIN_DEFICIT", ANEURYSM_MIN_DEFICIT_FALLBACK))
-    PyImGui.text(f"Estimated Energy deficit (Aneurysm fires at >= {threshold:.0f})")
-
-    # Liveness first. Without it, an all-zero table is ambiguous between "no
-    # foe has spent Energy" and "nothing is feeding the ledger".
-    event_count = ledger.recorded_event_count()
-    if event_count == 0:
-        PyImGui.text("No events billed. The cast sampler lives in HeroAI/interrupt.py --")
-        PyImGui.text("if HeroAI is not running, nothing feeds this ledger.")
-    else:
-        age_ms = ledger.ms_since_last_event()
-        age_text = "unknown" if age_ms is None else f"{age_ms / 1000.0:.1f}s ago"
-        PyImGui.text(f"{event_count} events billed, last {age_text}, {len(ledger.tracked_agent_ids())} foes tracked")
-
-    enemy_array = AgentArray.GetEnemyArray()
-    enemy_array = AgentArray.Filter.ByDistance(enemy_array, Player.GetXY(), Range.Spellcast.value)
-    enemy_array = AgentArray.Filter.ByCondition(enemy_array, lambda agent_id: Agent.IsAlive(agent_id))
-
-    if not enemy_array:
-        PyImGui.text("No living foes in spellcast range.")
-        return
-
-    # Canary: the day this stops reading 0, the whole estimate can be retired
-    # in favour of the real Energy bar.
-    raw_readable = sum(1 for agent_id in enemy_array if Agent.GetMaxEnergy(agent_id) > 0)
-    PyImGui.text(f"Raw foe Energy readable: {raw_readable}/{len(enemy_array)} (canary - expect 0)")
-
-    rows = []
-    for agent_id in enemy_array:
-        # Note: estimated_deficit prunes repaid entries as it reads. That is a
-        # side effect, but an idempotent one, and it keeps this view honest
-        # about what the gate would see right now.
-        rows.append((ledger.estimated_deficit(agent_id), agent_id))
-    rows.sort(reverse=True)
-
-    passing = sum(1 for deficit, _ in rows if deficit >= threshold)
-    PyImGui.text(f"Passing the gate: {passing} / {len(rows)} foes in range")
-    PyImGui.separator()
-
-    for deficit, agent_id in rows:
-        verdict = "PASSES" if deficit >= threshold else "  --  "
-        caster_tag = " caster" if Agent.IsCaster(agent_id) else ""
-        casting_tag = " CASTING" if Agent.IsCasting(agent_id) else ""
-        PyImGui.text(f"{verdict} {deficit:6.1f}  {_safe_name(agent_id)} [{agent_id}]{caster_tag}{casting_tag}")
-
-
-# endregion
-
-
 def main():
     if PyImGui.begin("Agent Enemy Debug Dump", PyImGui.WindowFlags.AlwaysAutoResize):
         PyImGui.text("Dumps enemy and dead-enemy agents to the console.")
         PyImGui.text("Names are identifiers only. No filtering by name or model is done.")
         if PyImGui.button("Dump Enemy Array"):
             dump_enemy_array()
-        _draw_energy_deficit_panel()
+        PyImGui.separator()
+        PyImGui.text("The estimated Energy-deficit view moved to the Agent Info Viewer widget")
+        PyImGui.text("(Widgets/Coding/Debug/Guild Wars/Agent Info.py), which already owns")
+        PyImGui.text("per-agent inspection and can show it alongside the effect list.")
     PyImGui.end()
 
 
