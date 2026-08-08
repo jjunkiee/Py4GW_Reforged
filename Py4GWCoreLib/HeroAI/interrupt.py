@@ -173,6 +173,26 @@ def is_classified_as_interrupt(skill_id: int) -> bool:
 # --- CastObserver: per-frame sampler ---
 
 
+def _bill_observed_cast_energy(agent_id: int, skill_id: int) -> None:
+    """Bill a newly observed enemy cast to the Energy-denial ledger.
+
+    The sampler already sees every cast start, and GW1 spends Energy at
+    activation, so this is the cheapest place to notice a foe running its pool
+    down -- no second per-frame enemy sweep, no completion tracking.
+
+    Imported lazily and swallowed on failure for two separate reasons: the
+    skills package pulls in ``BuildMgr``, which imports this module, so an
+    eager import would be a cycle; and this sampler is on the interrupt path,
+    where a bookkeeping fault must never cost a rupt.
+    """
+    try:
+        from Py4GWCoreLib.Builds.Skills import _energy_denial
+
+        _energy_denial.observe_enemy_cast(agent_id, skill_id)
+    except Exception:
+        pass
+
+
 class CastObserver:
     """Tracks every observed enemy cast within compass radius every frame.
 
@@ -239,6 +259,7 @@ class CastObserver:
             if key not in self._observations:
                 self._drop_agent(agent_id)
                 self._observations[key] = now
+                _bill_observed_cast_energy(agent_id, sid)
             live_keys.add(key)
 
         stale_cutoff = now - _OBSERVATION_MAX_AGE_MS
