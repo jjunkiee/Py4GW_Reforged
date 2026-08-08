@@ -5,7 +5,7 @@ from Py4GWCoreLib import Routines
 from Py4GWCoreLib import Allegiance
 from Py4GWCoreLib import Color
 from typing import Tuple
-from Py4GWCoreLib import AgentArray, Agent, Player
+from Py4GWCoreLib import GLOBAL_CACHE, AgentArray, Agent, Player, Range
 from Py4GWCoreLib.native_src.context.AgentContext import AgentStruct, AgentLivingStruct, AgentItemStruct, AgentGadgetStruct
 
 MODULE_NAME = "Agent Info Viewer"
@@ -27,6 +27,240 @@ window_module = ImGui.WindowModule(
 SELECTED_ALLIEGANCE = 0
 SELECTED_AGENT_INDEX = 0 
 SELECTED_AGENT_ID = 0    
+
+# endregion
+
+# region Effect and Energy-denial diagnostics
+
+# Fallback only. The live threshold is read from the ledger when it imports, so
+# this view cannot drift from the gate it claims to describe -- the constant is
+# used solely when the ledger will not import, at which point the panel has
+# nothing to show anyway.
+ANEURYSM_MIN_DEFICIT_FALLBACK = 15.0
+
+_ENERGY_LEDGER = None
+_ENERGY_LEDGER_RESOLVED = False
+
+
+def _colored_bool(value: bool) -> Tuple[int, int, int, int]:
+    return Color(0, 255, 0, 255).to_tuple() if value else Color(255, 0, 0, 255).to_tuple()
+
+
+def _energy_ledger():
+    """The shared deficit ledger, or None if it could not be imported.
+
+    Resolved once and cached. This view deliberately reads the *same* ledger
+    the Aneurysm gate reads rather than recomputing an estimate of its own -- a
+    debug view that measures something adjacent to the real thing is worse than
+    no debug view, because it lies with confidence.
+    """
+    global _ENERGY_LEDGER, _ENERGY_LEDGER_RESOLVED
+
+    if not _ENERGY_LEDGER_RESOLVED:
+        _ENERGY_LEDGER_RESOLVED = True
+        try:
+            from Py4GWCoreLib.Builds.Skills import _energy_denial
+
+            _ENERGY_LEDGER = _energy_denial
+        except Exception:
+            _ENERGY_LEDGER = None
+    return _ENERGY_LEDGER
+
+
+def _safe_agent_name(agent_id: int) -> str:
+    """Plain agent name for list rows. The decode-error detail lives in the
+    per-agent header; a ranked list wants something short."""
+    try:
+        return str(Agent.GetNameByID(agent_id) or "").strip() or "?"
+    except Exception:
+        return "?"
+
+
+def _safe_skill_name(skill_id: int) -> str:
+    try:
+        return str(GLOBAL_CACHE.Skill.GetName(skill_id) or "").strip() or "?"
+    except Exception:
+        return "?"
+
+
+def _skill_kind_tags(skill_id: int) -> str:
+    """Type tags for one effect, e.g. ``Mesmer Hex`` or ``Monk Enchantment``.
+
+    The profession comes from the *skill's* own record, which is what makes
+    "is this foe under a Mesmer hex" answerable at a glance. The agent effect
+    bitfield only ever says "hexed" -- it does not say by whom or with what.
+    """
+    flags = GLOBAL_CACHE.Skill.Flags
+    tags: list[str] = []
+    try:
+        _, profession_name = GLOBAL_CACHE.Skill.GetProfession(skill_id)
+        if profession_name and str(profession_name) not in ("None", "Unknown"):
+            tags.append(str(profession_name))
+        for label, predicate in (
+            ("Hex", flags.IsHex),
+            ("Enchantment", flags.IsEnchantment),
+            ("Stance", flags.IsStance),
+            ("WeaponSpell", flags.IsWeaponSpell),
+            ("Form", flags.IsForm),
+            ("Condition", flags.IsCondition),
+        ):
+            if predicate(skill_id):
+                tags.append(label)
+    except Exception:
+        return "?"
+    return " ".join(tags) if tags else "-"
+
+
+def _draw_effects_section(agent_id: int) -> None:
+    """Per-skill effect and buff list for one agent, plus a readability canary.
+
+    ``GLOBAL_CACHE.Effects`` is populated per agent, but the client is only
+    known to publish full effect data for the player's own party. Whether it
+    does the same for foes decides whether skills that care about a *specific*
+    hex can read the truth or must dead-reckon it the way the Energy ledger
+    does, so the counts are drawn even when both lists are empty: an empty list
+    sitting next to a set "Is Hexed" flag is the answer, and a blank panel is
+    not.
+    """
+    if not PyImGui.collapsing_header("Effects and Buffs"):
+        return
+
+    try:
+        buffs = list(GLOBAL_CACHE.Effects.GetBuffs(agent_id))
+        effects = list(GLOBAL_CACHE.Effects.GetEffects(agent_id))
+    except Exception as exc:
+        PyImGui.text(f"Effect read failed: {exc}")
+        return
+
+    is_hexed = Agent.IsHexed(agent_id)
+    is_enchanted = Agent.IsEnchanted(agent_id)
+
+    PyImGui.text(f"{len(effects)} effects, {len(buffs)} buffs")
+    PyImGui.text_colored(f"Bitfield: hexed={is_hexed}", _colored_bool(is_hexed))
+    PyImGui.same_line(0, -1)
+    PyImGui.text_colored(f"enchanted={is_enchanted}", _colored_bool(is_enchanted))
+
+    # The canary. The agent effect bitfield is known to work on foes; the
+    # per-skill list is the open question. Surfacing the contradiction is the
+    # entire reason this panel exists.
+    if (is_hexed or is_enchanted) and not (effects or buffs):
+        PyImGui.text_colored(
+            "CANARY: flagged hexed/enchanted, but no per-skill effect is readable.",
+            Color(255, 180, 0, 255).to_tuple(),
+        )
+    elif effects or buffs:
+        PyImGui.text_colored(
+            "Per-skill effects ARE readable for this agent.",
+            Color(0, 255, 0, 255).to_tuple(),
+        )
+
+    mesmer_hexes = [
+        effect.skill_id
+        for effect in effects + buffs
+        if _skill_kind_tags(effect.skill_id).startswith("Mesmer") and GLOBAL_CACHE.Skill.Flags.IsHex(effect.skill_id)
+    ]
+    PyImGui.text(f"Mesmer hexes detected: {len(mesmer_hexes)}")
+
+    headers = ["Source", "Skill ID", "Name", "Kind", "Time Left", "Attr"]
+    data = []
+    for effect in effects:
+        data.append(
+            (
+                "Effect",
+                str(effect.skill_id),
+                _safe_skill_name(effect.skill_id),
+                _skill_kind_tags(effect.skill_id),
+                f"{getattr(effect, 'time_remaining', 0)}",
+                f"{getattr(effect, 'attribute_level', 0)}",
+            )
+        )
+    for buff in buffs:
+        data.append(
+            (
+                "Buff",
+                str(buff.skill_id),
+                _safe_skill_name(buff.skill_id),
+                _skill_kind_tags(buff.skill_id),
+                "-",
+                "-",
+            )
+        )
+
+    if data:
+        ImGui.table(f"EffectList##effectlist{agent_id}", headers, data)
+    else:
+        PyImGui.text("No per-skill effects or buffs readable for this agent.")
+
+
+def _draw_energy_denial_section(agent_id: int) -> None:
+    """This agent's estimated Energy deficit, and whether the ledger is alive.
+
+    The estimate is dead reckoning over observed enemy casts and deliberate
+    drains, because the client does not publish foe Energy. See
+    ``Py4GWCoreLib/Builds/Skills/_energy_denial.py`` for exactly what it does
+    and does not claim.
+    """
+    if not PyImGui.collapsing_header("Energy Denial (estimated)"):
+        return
+
+    ledger = _energy_ledger()
+    if ledger is None:
+        PyImGui.text("Ledger unavailable: Py4GWCoreLib.Builds.Skills._energy_denial did not import.")
+        return
+
+    threshold = float(getattr(ledger, "ANEURYSM_DEFAULT_MIN_DEFICIT", ANEURYSM_MIN_DEFICIT_FALLBACK))
+    deficit = ledger.estimated_deficit(agent_id)
+    passes_gate = deficit >= threshold
+
+    PyImGui.text_colored(
+        f"This agent: {deficit:.1f} Energy missing "
+        f"({'PASSES' if passes_gate else 'below gate'}, Aneurysm fires at >= {threshold:.0f})",
+        _colored_bool(passes_gate),
+    )
+
+    # Canary: the day this reads non-zero for a foe, the whole estimate can be
+    # retired in favour of the real Energy bar.
+    PyImGui.text(f"Raw Energy readable: max_energy={Agent.GetMaxEnergy(agent_id)} (canary - expect 0 for foes)")
+
+    # Liveness first. Without it an all-zero table is ambiguous between "no foe
+    # has spent Energy" and "nothing is feeding the ledger".
+    event_count = ledger.recorded_event_count()
+    if event_count == 0:
+        PyImGui.text("No events billed. The cast sampler lives in HeroAI/interrupt.py --")
+        PyImGui.text("if HeroAI is not running, nothing feeds this ledger.")
+        return
+
+    age_ms = ledger.ms_since_last_event()
+    age_text = "unknown" if age_ms is None else f"{age_ms / 1000.0:.1f}s ago"
+    PyImGui.text(f"{event_count} events billed, last {age_text}, {len(ledger.tracked_agent_ids())} foes tracked")
+
+    enemy_array = AgentArray.GetEnemyArray()
+    enemy_array = AgentArray.Filter.ByDistance(enemy_array, Player.GetXY(), Range.Spellcast.value)
+    enemy_array = AgentArray.Filter.ByCondition(enemy_array, lambda enemy_id: Agent.IsAlive(enemy_id))
+    if not enemy_array:
+        PyImGui.text("No living foes in spellcast range.")
+        return
+
+    # estimated_deficit prunes repaid entries as it reads. That is a side
+    # effect, but an idempotent one, and it keeps this view honest about what
+    # the gate would see right now.
+    rows = sorted(((ledger.estimated_deficit(enemy_id), enemy_id) for enemy_id in enemy_array), reverse=True)
+    passing = sum(1 for row_deficit, _ in rows if row_deficit >= threshold)
+
+    PyImGui.separator()
+    PyImGui.text(f"Foes in spellcast range passing the gate: {passing} / {len(rows)}")
+    for row_deficit, enemy_id in rows:
+        row_verdict = "PASSES" if row_deficit >= threshold else "  --  "
+        caster_tag = " caster" if Agent.IsCaster(enemy_id) else ""
+        casting_tag = " CASTING" if Agent.IsCasting(enemy_id) else ""
+        PyImGui.text(
+            f"{row_verdict} {row_deficit:6.1f}  {_safe_agent_name(enemy_id)} [{enemy_id}]{caster_tag}{casting_tag}"
+        )
+
+
+# endregion
+
+# region ImGui
 def DrawMainWindow():
     global SELECTED_ALLIEGANCE, SELECTED_AGENT_INDEX, SELECTED_AGENT_ID
     def _get_type(agent:AgentStruct) -> str:
@@ -78,11 +312,8 @@ def DrawMainWindow():
             f"({agent.pos.x:.2f}, {agent.pos.y:.2f}, {agent.z:.2f})",
             _get_type(agent)
         )
-        
-    def _colored_bool(value: bool) -> Tuple[int, int, int, int]:
-        return Color(0,255,0,255).to_tuple() if value else Color(255,0,0,255).to_tuple()
-    
-    def _draw_agent_tab_item(agent_id:  int):
+
+    def _draw_agent_tab_item(agent_id: int):
         from Py4GWCoreLib import GLOBAL_CACHE
         _AGENT_ID = agent_id
         PyImGui.text(f"ID: {_AGENT_ID}")
@@ -393,6 +624,9 @@ def DrawMainWindow():
  
                     PyImGui.end_table()
     
+            _draw_effects_section(_AGENT_ID)
+            _draw_energy_denial_section(_AGENT_ID)
+
         if Agent.IsItem(_AGENT_ID):
             if PyImGui.collapsing_header("Item Agent Data"):
                 flags = PyImGui.TableFlags.Borders | PyImGui.TableFlags.SizingStretchSame | PyImGui.TableFlags.Resizable
@@ -544,34 +778,44 @@ def DrawMainWindow():
             PyImGui.end_child()
             
         if PyImGui.begin_child("InfoGlobalArea", size=(600, 500),border=True, flags=PyImGui.WindowFlags.HorizontalScrollbar):
+            # Tab IDs are fixed strings on purpose. A tab item's identity in
+            # ImGui *is* its ID, so embedding the agent id -- as this did --
+            # destroys and recreates the tab every time the underlying agent
+            # changes. "Target" changes on every retarget and "Enemy" changes
+            # whenever a different foe becomes nearest, so the selected tab kept
+            # vanishing mid-fight and the bar fell back to the first tab. The
+            # agent id belongs in the body (it is the first line of it), not in
+            # the identity of the container. This also stops every collapsing
+            # header inside from resetting, since BeginTabItem pushes the tab's
+            # ID onto the stack that those headers are keyed against.
             if PyImGui.begin_tab_bar("InfoTabBar"):
                 if player and player.agent_id != 0:
-                    if PyImGui.begin_tab_item(f"{"Player"}##tab{player.agent_id}"):
+                    if PyImGui.begin_tab_item("Player##tabPlayer"):
                         _draw_agent_tab_item(player.agent_id)
                         PyImGui.end_tab_item()
                 
-                if target and target.agent_id is not None:
-                    if PyImGui.begin_tab_item(f"{"Target"}##tab{target.agent_id}"):
+                if target and target.agent_id != 0:
+                    if PyImGui.begin_tab_item("Target##tabTarget"):
                         _draw_agent_tab_item(target.agent_id)
                         PyImGui.end_tab_item()
                 if nearest_enemy and nearest_enemy.agent_id != 0:
-                    if PyImGui.begin_tab_item(f"{"Enemy"}##tab{nearest_enemy.agent_id}"):
+                    if PyImGui.begin_tab_item("Enemy##tabEnemy"):
                         _draw_agent_tab_item(nearest_enemy.agent_id)
                         PyImGui.end_tab_item()
                 if nearest_ally and nearest_ally.agent_id != 0:
-                    if PyImGui.begin_tab_item(f"{"Ally"}##tab{nearest_ally.agent_id}"):
+                    if PyImGui.begin_tab_item("Ally##tabAlly"):
                         _draw_agent_tab_item(nearest_ally.agent_id)
                         PyImGui.end_tab_item()
                 if nearest_item and nearest_item.agent_id != 0:
-                    if PyImGui.begin_tab_item(f"{"Item"}##tab{nearest_item.agent_id}"):
+                    if PyImGui.begin_tab_item("Item##tabItem"):
                         _draw_agent_tab_item(nearest_item.agent_id)
                         PyImGui.end_tab_item()
                 if nearest_gadget and nearest_gadget.agent_id != 0:
-                    if PyImGui.begin_tab_item(f"{"Gadget"}##tab{nearest_gadget.agent_id}"):
+                    if PyImGui.begin_tab_item("Gadget##tabGadget"):
                         _draw_agent_tab_item(nearest_gadget.agent_id)
                         PyImGui.end_tab_item()
                 if nearest_npc and nearest_npc.agent_id != 0:
-                    if PyImGui.begin_tab_item(f"{"NPC"}##tab{nearest_npc.agent_id}"):
+                    if PyImGui.begin_tab_item("NPC##tabNPC"):
                         _draw_agent_tab_item(nearest_npc.agent_id)
                         PyImGui.end_tab_item()
                         
