@@ -514,6 +514,20 @@ class CombatClass:
 
         return self.in_casting_routine
 
+    def MarkExternalCast(self, aftercast_delay: int = 250) -> None:
+        """Arm the aftercast window for a cast this class did not perform.
+
+        ``HandleCombat`` arms ``in_casting_routine`` / ``aftercast_timer``
+        itself, and the HeroAI drivers gate a whole tick on
+        :meth:`InCastingRoutine`. A caller that casts by another route -- a
+        ``BuildMgr`` skill helper, for example -- must report it here, or the
+        next frame sees an idle handler and fires a second skill inside this
+        one's aftercast.
+        """
+        self.aftercast = max(0, int(aftercast_delay))
+        self.in_casting_routine = True
+        self.aftercast_timer.Reset()
+
     def GetPartyTargetID(self) -> int:
         if not GLOBAL_CACHE.Party.IsPartyLoaded():
             return 0

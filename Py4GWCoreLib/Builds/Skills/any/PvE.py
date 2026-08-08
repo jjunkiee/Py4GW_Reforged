@@ -35,9 +35,25 @@ ALCOHOL_MODEL_IDS = (
 )
 
 
+# How long to wait for Effects.GetAlcoholLevel() to reflect a drink before
+# considering another one. CombatClass keeps its own equivalent throttle for
+# the declarative engine's alcohol path.
+ALCOHOL_RECHECK_DELAY_MS = 500
+
+
 class PvE:
     def __init__(self, build: BuildMgr) -> None:
         self.build: BuildMgr = build
+        # Must outlive a single tick: these helpers are generators driven one
+        # step per frame and then discarded, so a throttle held in a local
+        # would never survive to stop the next tick from drinking again.
+        self._next_alcohol_recheck_ms: float = 0.0
+
+    @staticmethod
+    def _now_ms() -> float:
+        import time as _time
+
+        return _time.monotonic() * 1000.0
 
     def _get_drunk_level(self) -> int:
         try:
@@ -45,17 +61,35 @@ class PvE:
         except Exception:
             return 0
 
-    def _use_alcohol_if_needed(self, target_level: int = 1) -> int:
+    def _is_alcohol_topoff_pending(self) -> bool:
+        return self._now_ms() < self._next_alcohol_recheck_ms
+
+    def _use_alcohol_if_needed(self, target_level: int = 1) -> bool:
+        """Consume one alcohol item when below ``target_level``.
+
+        Returns True when an item was actually consumed, which obliges the
+        caller to end the tick rather than carry on casting. The throttle set
+        here is the part that matters across ticks: a drink is only visible
+        once the client updates the alcohol level, and these helpers are
+        generators driven one step per frame and then discarded, so without it
+        the helper re-enters and drinks again every tick until the level
+        catches up. ``CombatClass`` guards its own alcohol path the same way.
+        """
         if self._get_drunk_level() >= target_level:
-            return 0
+            self._next_alcohol_recheck_ms = 0.0
+            return False
+
+        if self._is_alcohol_topoff_pending():
+            return False
 
         for model_id in ALCOHOL_MODEL_IDS:
             item_id = GLOBAL_CACHE.Inventory.GetFirstModelID(int(model_id))
             if item_id:
                 GLOBAL_CACHE.Inventory.UseItem(item_id)
-                return 500
+                self._next_alcohol_recheck_ms = self._now_ms() + ALCOHOL_RECHECK_DELAY_MS
+                return True
 
-        return 0
+        return False
 
     def Air_of_Superiority(self) -> BuildCoroutine:
         from Py4GWCoreLib import Player, GLOBAL_CACHE
@@ -148,9 +182,17 @@ class PvE:
             if remaining_ms > refresh_window_ms:
                 return False
 
-        wait_ms = self._use_alcohol_if_needed(target_drunk_level)
-        if wait_ms > 0:
-            yield from Routines.Yield.wait(wait_ms)
+        # Suspend after drinking rather than returning. Returning would let the
+        # caller fall through to CombatClass.HandleCombat, whose alcohol
+        # throttle is a separate field, and a second item would be consumed in
+        # the same frame. Yielding ends the tick instead; the throttle set by
+        # _use_alcohol_if_needed is what stops the next tick from drinking
+        # again, whether or not this generator is resumed.
+        if self._use_alcohol_if_needed(target_drunk_level):
+            yield from Routines.Yield.wait(ALCOHOL_RECHECK_DELAY_MS)
+            return False
+        if self._is_alcohol_topoff_pending():
+            return False
 
         return (yield from self.build.CastSkillID(
             skill_id=drunken_master_id,

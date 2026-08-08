@@ -1,6 +1,12 @@
+from typing import TYPE_CHECKING
+
 from Py4GWCoreLib import Agent, Map, Player, Profession, Routines
 from Py4GWCoreLib import BuildMgr
-from Py4GWCoreLib.BuildMgr import BuildRegistry
+from Py4GWCoreLib.BuildMgr import BuildCoroutine, BuildRegistry
+
+if TYPE_CHECKING:
+    from Py4GWCoreLib.Builds.Skills._registry import HelperRegistry
+    from Py4GWCoreLib.Builds.Skills.SkillsTemplate import SkillsTemplate
 
 
 class HeroAI_Build(BuildMgr):
@@ -13,6 +19,12 @@ class HeroAI_Build(BuildMgr):
         )
         self._cached_data = cached_data
         self._standalone_fallback = standalone_fallback
+        # Held under a private name on purpose: concrete builds park their
+        # SkillsTemplate on ``self.skills``, which collides with the
+        # ``list[int]`` that BuildMgr declares there.
+        self._skill_helpers: SkillsTemplate | None = None
+        self._helper_registry: HelperRegistry | None = None
+        self._helper_dispatch_cache: tuple[tuple[int, ...], tuple[int, ...]] | None = None
         if match_only:
             self._build_registry = None
             self._contract_map_signature = None
@@ -144,6 +156,152 @@ class HeroAI_Build(BuildMgr):
             return None
         return self._prepare_combat()
 
+    def _get_skill_helper_registry(self) -> "HelperRegistry | None":
+        """Reflective ``skill_id -> helper`` map over ``Builds/Skills``.
+
+        Built once, lazily: ``Skill.GetID`` needs loaded client skill data, so
+        the first attempt can legitimately come up empty. An empty result is
+        not cached, so a premature build is retried on the next tick instead of
+        disabling helper dispatch for the session.
+        """
+        if self._helper_registry is not None:
+            return self._helper_registry
+
+        import PySystem
+
+        from Py4GWCoreLib import ConsoleLog
+        from Py4GWCoreLib.Builds.Skills._registry import build_helper_registry
+        from Py4GWCoreLib.Builds.Skills.SkillsTemplate import SkillsTemplate
+        from Py4GWCoreLib.Skill import Skill
+
+        if self._skill_helpers is None:
+            self._skill_helpers = SkillsTemplate(self)
+
+        registry = build_helper_registry(self._skill_helpers, Skill.GetID)
+        if not registry.entries:
+            return None
+
+        # Logged once per registry build. The count matters because the
+        # registry is latched here: if client skill data was only partly loaded
+        # the map is quietly smaller than it should be, and this line is the
+        # only way to notice.
+        ConsoleLog(
+            self.build_name,
+            f"skill helper registry built: {len(registry.entries)} helpers, {len(registry.shadowed)} shadowed",
+            PySystem.Console.MessageType.Debug,
+        )
+
+        # A shadowed helper means two owners claim the same skill, which is a
+        # defect in the skills tree rather than a runtime condition -- worth
+        # seeing, not worth failing on.
+        for shadowed_entry in registry.shadowed:
+            winner = registry.entries[shadowed_entry.skill_id]
+            ConsoleLog(
+                self.build_name,
+                f"skill {shadowed_entry.skill_id}: using {winner.qualified_name}, "
+                f"shadowing {shadowed_entry.qualified_name}",
+                PySystem.Console.MessageType.Debug,
+            )
+
+        self._helper_registry = registry
+        return registry
+
+    def _get_helper_dispatch_skill_ids(self, registry: "HelperRegistry") -> tuple[int, ...]:
+        """Equipped skills this build drives through a hand-written helper.
+
+        Skills carrying ``SkillLock`` or ``SpikeLock`` are deliberately left to
+        ``CombatClass``. Those coordinate across heroes through the COOLDOWN /
+        CALL_TARGET whiteboard locks that ``CombatClass`` posts; the helper
+        path posts a different lock kind, or none, so taking them over would
+        make peers see no claim and fire simultaneously.
+        """
+        current_skills = tuple(int(skill_id) for skill_id in self._get_current_skills())
+        if self._helper_dispatch_cache is not None and self._helper_dispatch_cache[0] == current_skills:
+            return self._helper_dispatch_cache[1]
+
+        dispatch_skill_ids: list[int] = []
+        for skill_id in current_skills:
+            if skill_id not in registry.entries:
+                continue
+            custom_skill = self.GetCustomSkill(skill_id)
+            if getattr(custom_skill, "SkillLock", False) or getattr(custom_skill, "SpikeLock", False):
+                continue
+            dispatch_skill_ids.append(skill_id)
+
+        resolved = tuple(dispatch_skill_ids)
+        self._helper_dispatch_cache = (current_skills, resolved)
+        return resolved
+
+    def _try_skill_helpers(
+        self,
+        cached_data,
+        registry: "HelperRegistry",
+        dispatch_skill_ids: tuple[int, ...],
+        is_in_combat: bool,
+    ) -> BuildCoroutine:
+        """Drive the first helper that fires, in HeroAI's own priority order.
+
+        Ordering, per-slot enable flags, recharge, the blocked-skill mask and
+        the out-of-combat gate are all read from ``CombatClass`` rather than
+        recomputed, so helper dispatch and the declarative engine cannot
+        disagree about what is castable.
+        """
+        combat_handler = cached_data.combat_handler
+        allowed_skill_ids = set(dispatch_skill_ids)
+
+        for slot in range(len(combat_handler.skills)):
+            if not combat_handler.IsSkillReady(slot):
+                continue
+
+            skill_id = int(combat_handler.skills[slot].skill_id)
+            if skill_id not in allowed_skill_ids:
+                continue
+
+            if not is_in_combat and not combat_handler.IsOOCSkill(slot):
+                continue
+
+            entry = registry.entries.get(skill_id)
+            if entry is None:
+                continue
+
+            if (yield from entry.call()):
+                return True
+
+        return False
+
+    def _run_generic_fallback(self, cached_data, is_in_combat: bool) -> BuildCoroutine:
+        """Generic path: hand-written helpers first, declarative engine after.
+
+        The auction found no matching build, so ``Builds/Skills`` would
+        otherwise be unreachable. Offer each equipped skill to its helper
+        first, and let ``CombatClass`` handle everything the helpers decline.
+
+        The blocked-skill mask is deliberately left alone. Masking every
+        helper-covered skill would strand any skill whose helper is narrower
+        than the declarative engine -- ``PvE.Reversal_of_Death`` declines
+        outside the Dhuum encounter, and a masked copy would then be cast by
+        nobody. It would also overwrite the claim a concrete build applies
+        when it uses this build as its fallback handler.
+        """
+        registry = self._get_skill_helper_registry()
+        dispatch_skill_ids: tuple[int, ...] = ()
+        if registry is not None:
+            dispatch_skill_ids = self._get_helper_dispatch_skill_ids(registry)
+
+        if registry is not None and dispatch_skill_ids:
+            if (yield from self._try_skill_helpers(cached_data, registry, dispatch_skill_ids, is_in_combat)):
+                # The helper cast outside HandleCombat, so the aftercast window
+                # the drivers gate on has to be armed explicitly.
+                cached_data.combat_handler.MarkExternalCast()
+                self.SetTickSuccess()
+                return
+
+        if cached_data.combat_handler.HandleCombat(cached_data, ooc=not is_in_combat):
+            self.SetTickSuccess()
+        else:
+            self.SetTickFailure()
+        yield
+
     def _run_contract(self, cached_data, is_in_combat: bool):
         contract_build = self.EnsureBuildContract(cached_data)
         if contract_build is None:
@@ -152,11 +310,7 @@ class HeroAI_Build(BuildMgr):
             return
 
         if contract_build is self:
-            if cached_data.combat_handler.HandleCombat(cached_data, ooc=not is_in_combat):
-                self.SetTickSuccess()
-            else:
-                self.SetTickFailure()
-            yield
+            yield from self._run_generic_fallback(cached_data, is_in_combat)
             return
 
         contract_build.ResetTickState()
