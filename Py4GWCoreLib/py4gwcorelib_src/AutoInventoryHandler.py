@@ -172,6 +172,13 @@ class AutoInventoryHandler():
             if self.id_golds:
                 rarity_filter.add(Rarity.Gold)
 
+            # An empty filter is treated as "no rarity restriction" further down, so turning every
+            # auto-identify rarity off used to identify the whole bag and burn ID kits. Off is off.
+            # Only the flag-derived path returns here; an explicit rarities argument is never empty.
+            if not rarity_filter:
+                self._debug_log("Identify", "Skip all reason=no_auto_identify_rarity_enabled")
+                return []
+
         selected_item_ids: list[int] = []
         self._debug_log(
             "Identify",
@@ -187,7 +194,7 @@ class AutoInventoryHandler():
             if item.model_id in self.id_model_blacklist:
                 self._debug_log("Identify", f"Skip {summary} reason=model_blacklisted")
                 continue
-            if rarity_filter and item.rarity not in rarity_filter:
+            if item.rarity not in rarity_filter:
                 self._debug_log("Identify", f"Skip {summary} reason=rarity_not_selected")
                 continue
             self._debug_log("Identify", f"Select {summary} action=identify")

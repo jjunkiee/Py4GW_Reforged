@@ -187,7 +187,15 @@ class ItemSnapshot:
         self._data: Optional[ItemData] | _UnsetType = _UNSET
 
     @classmethod
-    @frame_cache(category="LazyItemSnapshot", source_lib="from_item_id")
+    # Key on item_id explicitly. The default key is the whole argument tuple, and the Reforged
+    # item_instance is unhashable, so FrameCache fell back to id(<temporary args tuple>) - an
+    # address CPython reuses on every loop iteration. Every slot then shared one cache entry and
+    # the entire inventory read back as whichever item was snapshotted first.
+    @frame_cache(
+        category="LazyItemSnapshot",
+        source_lib="from_item_id",
+        key=lambda cls, item_id, item_instance=None: item_id,
+    )
     def from_item_id(cls, item_id: int, item_instance: Optional[PyItem] = None) -> Optional['ItemSnapshot']:
         # Reforged: items may be dicts from PyInventory.GetItems() — handled by Py4GWCoreLib monkey-patch
         if item_instance is not None:
@@ -209,7 +217,11 @@ class ItemSnapshot:
         return cls(item_id, item, bag) if is_valid else None
 
     def _load_name_bytes(self, loader) -> Optional[bytes]:
-        return bytes(loader(self.id)) if self.id > 0 and self.is_valid else None
+        # loader is an unbound PyItem method, so it needs the item instance as self - passing the
+        # raw id raised "incompatible function arguments" and broke every snapshot name.
+        if self.id <= 0 or not self.is_valid:
+            return None
+        return bytes(loader(Item.item_instance(self.id)))
 
     def _get_parsed_item_data(self) -> _LazyParsedItemData:
         if self._parsed_item_data is _UNSET:

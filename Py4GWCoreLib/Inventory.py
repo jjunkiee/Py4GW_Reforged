@@ -455,6 +455,12 @@ class Inventory:
         return Inventory._salvage_dialog().exists
 
     @staticmethod
+    def IsSalvageChoiceConfirmVisible() -> bool:
+        # Public successor to the removed _get_salvage_choice_confirm_frame_id(). _salvage_confirm()
+        # already folds in the SalvageWindow.Button fallback that callers used to check separately.
+        return Inventory._salvage_confirm().exists
+
+    @staticmethod
     def _build_frame_children_map() -> dict[int, list[int]]:
         from collections import defaultdict
         from .FrameTree import FrameTree
