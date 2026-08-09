@@ -107,6 +107,18 @@ def main():
             next(routine)
         except StopIteration:
             GLOBAL_CACHE.Coroutines.remove(routine)
+        except Exception as coroutine_error:
+            # This pump is shared by every script. Letting one faulty coroutine escape skipped the
+            # action queues below for that whole frame and reported only "Exception ignored".
+            import traceback
+
+            GLOBAL_CACHE.Coroutines.remove(routine)
+            ConsoleLog(
+                MODULE_NAME,
+                f"Dropped a coroutine that raised: {coroutine_error}",
+                Console.MessageType.Error,
+            )
+            ConsoleLog(MODULE_NAME, f"Stack trace: {traceback.format_exc()}", Console.MessageType.Error)
     
     if Map.IsMapLoading() or Map.IsInCinematic():
         widget_config.action_queue_manager.ResetNonTransitionQueues()

@@ -216,7 +216,9 @@ class UIManagerExtensions:
     
     @staticmethod
     def IsSalvageWindowOpen() -> bool:
-        return Frame(FrameId.SalvageWindow.Button).exists
+        # _get_salvage_choice_confirm_frame_id() was refactored away; the replacement predicate
+        # already covers the SalvageWindow.Button fallback this used to check itself.
+        return Inventory.IsSalvageChoiceConfirmVisible()
     
     @staticmethod
     def IsSalvageWindowNoIdentifiedOpen() -> bool:
