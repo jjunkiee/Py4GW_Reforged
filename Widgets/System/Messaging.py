@@ -735,21 +735,27 @@ def SnapshotHeroAIOptions(account_email: str):
 
 
 
-def RestoreHeroAISnapshot(account_email: str):
+
+def RestoreHeroAISnapshot(account_email: str) -> bool:
+    """Pop one snapshot and put those options back. False when there was nothing to restore.
+
+    Exactly one restore per SnapshotHeroAIOptions. An empty stack means this caller never suspended
+    anything, so it must leave the options alone: forcing all five on would overwrite whatever the
+    user set and, because Looting is one of them, re-arm the very sender that got us here.
+    Callers that genuinely mean "turn HeroAI back on" ask for that explicitly on a False return.
+    """
     global hero_ai_snapshots
     if not account_email:
-        return
+        return False
     account_snapshots = hero_ai_snapshots.get(account_email, [])
     
     if not account_snapshots:
-        EnableHeroAIOptions(account_email)  # If no snapshot, just enable everything to be safe
-        ConsoleLog(MODULE_NAME, "No Hero AI snapshot found, enabling all options as fallback.", Console.MessageType.Warning, True)
-        return
-    
+        return False
+
     hero_ai_options = GLOBAL_CACHE.ShMem.GetHeroAIOptionsFromEmail(account_email)
     if hero_ai_options is None:
-        return
-    
+        return False
+
     last_state = account_snapshots.pop()
     if not account_snapshots:
         hero_ai_snapshots.pop(account_email, None)
@@ -761,6 +767,7 @@ def RestoreHeroAISnapshot(account_email: str):
     hero_ai_options.Combat = last_state.Combat
     for skill_index in range(SHMEM_MAX_NUMBER_OF_SKILLS):
         hero_ai_options.Skills[skill_index] = bool(last_state.Skills[skill_index])
+    return True
 
 
 _HERO_AI_SUSPENDING_COMMANDS = {
@@ -2105,6 +2112,7 @@ def OpenChest(index: int, message: SharedMessageStruct):
 # region PickUpLoot
 def PickUpLoot(index:int , message: SharedMessageStruct):
     def _get_loot_exit_reason() -> str:
+        """Report only. Unwinding belongs to the `finally`, which owns the snapshot and the message."""
         if not Routines.Checks.Map.MapValid():
             return "map_invalid"
 
@@ -2117,6 +2125,12 @@ def PickUpLoot(index:int , message: SharedMessageStruct):
             return "inventory_full"
 
         return ""
+
+    def _log_loot_exit(reason: str) -> None:
+        if reason == "map_invalid":
+            ConsoleLog("PickUp Loot", "Map is not valid, halting.", Console.MessageType.Warning)
+        elif reason == "inventory_full":
+            ConsoleLog("PickUp Loot", "No free slots in inventory, halting.", Console.MessageType.Warning)
 
     def _GetBaseTimestamp():
         SHMEM_ZERO_EPOCH = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
@@ -2160,10 +2174,7 @@ def PickUpLoot(index:int , message: SharedMessageStruct):
                 if claimed_item_id:
                     clear_loot_lock(claimed_item_id)
                     claimed_item_id = 0
-                if exit_reason == "map_invalid":
-                    ConsoleLog("PickUp Loot", "Map is not valid, halting.", Console.MessageType.Warning)
-                elif exit_reason == "inventory_full":
-                    ConsoleLog("PickUp Loot", "No free slots in inventory, halting.", Console.MessageType.Warning)
+                _log_loot_exit(exit_reason)
                 ActionQueueManager().ResetAllQueues()
                 return
 
@@ -2224,18 +2235,7 @@ def PickUpLoot(index:int , message: SharedMessageStruct):
                     if claimed_item_id:
                         clear_loot_lock(claimed_item_id)
                         claimed_item_id = 0
-                    if exit_reason == "map_invalid":
-                        ConsoleLog(
-                            "PickUp Loot",
-                            "Map is not valid, halting.",
-                            Console.MessageType.Warning,
-                        )
-                    elif exit_reason == "inventory_full":
-                        ConsoleLog(
-                            "PickUp Loot",
-                            "No free slots in inventory, halting.",
-                            Console.MessageType.Warning,
-                        )
+                    _log_loot_exit(exit_reason)
                     ActionQueueManager().ResetAllQueues()
                     return
 
@@ -2274,8 +2274,10 @@ def MessageEnableHeroAI(index: int, message: SharedMessageStruct):
     account_email = message.ReceiverEmail
     if message.Params[0]:
         EnableHeroAIOptions(account_email)
-    else:
-        RestoreHeroAISnapshot(account_email)
+    elif not RestoreHeroAISnapshot(account_email):
+        # An explicit "enable HeroAI" must not be a no-op just because no suspend was outstanding.
+        # This is the only place that fallback belongs -- somebody asked for it.
+        EnableHeroAIOptions(account_email)
     GLOBAL_CACHE.ShMem.MarkMessageAsFinished(account_email, index)
     ConsoleLog(MODULE_NAME, "EnableHeroAI message processed and finished.", Console.MessageType.Info, False)
     yield
