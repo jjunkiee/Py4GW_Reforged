@@ -1372,7 +1372,10 @@ class InventoryPlusWidget:
     def load_auto_handler_settings(self):
         self.auto_inventory_handler.module_active = self._ini_get_bool(section="AutoManager", var_name="module_active", default=False)
         self.auto_inventory_handler._LOOKUP_TIME = self._ini_get_int(section="AutoManager", var_name="lookup_time", default=15000)
-        
+                self.auto_inventory_handler.debug_item_selection = self._ini_get_bool(
+            section="AutoManager", var_name="debug_item_selection", default=False
+        )
+
         self.auto_inventory_handler.id_whites = self._ini_get_bool(section="AutoIdentify", var_name="id_whites", default=False)
         self.auto_inventory_handler.id_blues = self._ini_get_bool(section="AutoIdentify", var_name="id_blues", default=True)
         self.auto_inventory_handler.id_greens = self._ini_get_bool(section="AutoIdentify", var_name="id_greens", default=False)
@@ -1380,6 +1383,9 @@ class InventoryPlusWidget:
         self.auto_inventory_handler.id_golds = self._ini_get_bool(section="AutoIdentify", var_name="id_golds", default=False)
         
         self.auto_inventory_handler.salvage_whites = self._ini_get_bool(section="AutoSalvage", var_name="salvage_whites", default=True)
+        self.auto_inventory_handler.salvage_rare_materials = self._ini_get_bool(
+            section="AutoSalvage", var_name="salvage_rare_materials", default=False
+        )
         self.auto_inventory_handler.salvage_blues = self._ini_get_bool(section="AutoSalvage", var_name="salvage_blues", default=True)
         self.auto_inventory_handler.salvage_purples = self._ini_get_bool(section="AutoSalvage", var_name="salvage_purples", default=True)
         self.auto_inventory_handler.salvage_golds = self._ini_get_bool(section="AutoSalvage", var_name="salvage_golds", default=False)
@@ -2737,8 +2743,18 @@ class InventoryPlusWidget:
                     cfg = self.salvage_settings
                     if PyImGui.collapsing_header("Salvage Menu Options:"):
                         color = ColorPalette.GetColor("dark_red")
-                        PyImGui.text_colored("These settings periodically salvage items for materials based on the options below.", color.to_tuple_normalized())
-                        PyImGui.text_colored("Upgrade/component salvage prompts can be auto-handled in the dialog section below.", color.to_tuple_normalized())
+                        PyImGui.text_colored(
+                            "These settings only choose which Salvage entries appear in the item right-click menu.",
+                            color.to_tuple_normalized(),
+                        )
+                        PyImGui.text_colored(
+                            "Interval salvaging is configured under 'Automatic Handling Options' further down this tab.",
+                            color.to_tuple_normalized(),
+                        )
+                        PyImGui.text_colored(
+                            "Upgrade/component salvage prompts can be auto-handled in the dialog section below.",
+                            color.to_tuple_normalized(),
+                        )
                         PyImGui.separator()
                         cfg.salvage_whites = ini_colored_checkbox(label="Show Salvage Whites in Menu",section="Salvage",var_name="salvage_whites",cfg_obj=cfg,color=GW_WHITE,default=cfg.salvage_whites)
                         cfg.salvage_blues = ini_colored_checkbox(label="Show Salvage Blues in Menu",section="Salvage",var_name="salvage_blues",cfg_obj=cfg,color=GW_BLUE,default=cfg.salvage_blues)
@@ -2961,6 +2977,20 @@ class InventoryPlusWidget:
                     if new_val != old_val:
                         self._set_auto_inventory_enabled(new_val)
               
+                    self.auto_inventory_handler.debug_item_selection = ini_colored_checkbox(
+                        "Log Item Selection Decisions",
+                        "AutoManager",
+                        "debug_item_selection",
+                        self.auto_inventory_handler,
+                        GW_WHITE,
+                        default=self.auto_inventory_handler.debug_item_selection,
+                    )
+                    if PyImGui.is_item_hovered():
+                        PyImGui.begin_tooltip()
+                        PyImGui.text("Logs why each item was identified, salvaged, deposited or skipped.")
+                        PyImGui.text("Turn this on when the handler runs on schedule but nothing happens.")
+                        PyImGui.end_tooltip()
+
                     old_val = self._ini_get_int(section="AutoManager", var_name="lookup_time", default=self.auto_inventory_handler._LOOKUP_TIME)
                     new_val = PyImGui.input_int("Inventory Check Interval (ms)", old_val)
                     if new_val != old_val:
@@ -2969,9 +2999,87 @@ class InventoryPlusWidget:
                         self._ini_set(section="AutoManager",var_name="lookup_time",value=new_val)
                     
                     color = ColorPalette.GetColor("dark_red")
-                    if Routines.Checks.Map.IsOutpost():
-                        PyImGui.text_colored("Timer is paused in Outposts.", color.to_tuple_normalized())
-                    PyImGui.text(f"next check in {max(0, self.auto_inventory_handler._LOOKUP_TIME - self.auto_inventory_handler.lookup_throttle.GetTimeElapsed()):.3f} ms")
+                    # A stopped throttle reports 0 elapsed, so the old "next check in" countdown
+                    # froze at the interval value and looked like a timer that was about to fire.
+                    if self.auto_inventory_handler.lookup_throttle.IsStopped():
+                        where = "outposts" if Routines.Checks.Map.IsOutpost() else "this map"
+                        PyImGui.text_colored(
+                            f"Interval timer is paused in {where}; the auto pass only runs once on zone-in.",
+                            color.to_tuple_normalized(),
+                        )
+                        PyImGui.text_colored(
+                            "Changing settings here does not re-trigger it. Zone out and back, or use Run Now.",
+                            color.to_tuple_normalized(),
+                        )
+                    else:
+                        PyImGui.text(
+                            f"next check in {max(0, self.auto_inventory_handler._LOOKUP_TIME - self.auto_inventory_handler.lookup_throttle.GetTimeElapsed()):.0f} ms"
+                        )
+
+                    if PyImGui.button("Run Identify + Salvage Now"):
+                        from Py4GWCoreLib.GlobalCache import GLOBAL_CACHE
+                        from Py4GWCoreLib.py4gwcorelib_src.Console import Console, ConsoleLog
+
+                        if self.auto_inventory_handler.status == "Idle":
+                            GLOBAL_CACHE.Coroutines.append(self.auto_inventory_handler.IDAndSalvageItems())
+                            ConsoleLog("Inventory Plus", "Queued an Identify + Salvage pass.", Console.MessageType.Info)
+                        else:
+                            ConsoleLog(
+                                "Inventory Plus",
+                                f"Auto handler is busy ({self.auto_inventory_handler.status}); pass not queued.",
+                                Console.MessageType.Warning,
+                            )
+                    if PyImGui.is_item_hovered():
+                        PyImGui.begin_tooltip()
+                        PyImGui.text("Runs the auto Identify + Salvage pass immediately, ignoring the interval.")
+                        PyImGui.text("Use this to test in an outpost, where the interval timer is paused.")
+                        PyImGui.end_tooltip()
+
+                    # The interval reads the AutoIdentify/AutoSalvage flags, not the menu-visibility
+                    # ones on the Identification/Salvage tabs. Show what it will actually act on.
+                    PyImGui.separator()
+                    auto_id_rarities = [
+                        name
+                        for name, enabled in (
+                            ("Whites", self.auto_inventory_handler.id_whites),
+                            ("Blues", self.auto_inventory_handler.id_blues),
+                            ("Greens", self.auto_inventory_handler.id_greens),
+                            ("Purples", self.auto_inventory_handler.id_purples),
+                            ("Golds", self.auto_inventory_handler.id_golds),
+                        )
+                        if enabled
+                    ]
+                    auto_salvage_rarities = [
+                        name
+                        for name, enabled in (
+                            ("Whites", self.auto_inventory_handler.salvage_whites),
+                            ("Rare Materials", self.auto_inventory_handler.salvage_rare_materials),
+                            ("Blues", self.auto_inventory_handler.salvage_blues),
+                            ("Purples", self.auto_inventory_handler.salvage_purples),
+                            ("Golds", self.auto_inventory_handler.salvage_golds),
+                        )
+                        if enabled
+                    ]
+                    PyImGui.text(
+                        f"Auto Identify: {', '.join(auto_id_rarities) if auto_id_rarities else 'nothing enabled'}"
+                    )
+                    PyImGui.text(
+                        f"Auto Salvage: {', '.join(auto_salvage_rarities) if auto_salvage_rarities else 'nothing enabled'}"
+                    )
+                    if self.auto_inventory_handler.module_active and not auto_salvage_rarities:
+                        PyImGui.text_colored(
+                            "Auto salvage will do nothing. Enable rarities under Salvage > Automatic Handling Options.",
+                            color.to_tuple_normalized(),
+                        )
+                    if self.auto_inventory_handler.module_active and not auto_id_rarities:
+                        PyImGui.text_colored(
+                            "Auto identify will do nothing. Enable rarities under Identification > Automatic Handling Options.",
+                            color.to_tuple_normalized(),
+                        )
+                        PyImGui.text_colored(
+                            "Unidentified blues, purples and golds are skipped by salvage until they are identified.",
+                            color.to_tuple_normalized(),
+                        )
                     PyImGui.end_tab_item()
                 PyImGui.end_tab_bar()
             PyImGui.separator()
