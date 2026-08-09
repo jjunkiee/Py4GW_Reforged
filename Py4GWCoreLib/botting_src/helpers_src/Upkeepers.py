@@ -175,6 +175,12 @@ class _Upkeepers:
                 yield from Routines.Yield.wait(500)
                 continue
             
+            # Same threshold the other senders use: a full bag must not keep dispatching pickups
+            # that can only fail on arrival.
+            if GLOBAL_CACHE.Inventory.GetFreeSlotCount() <= 1:
+                yield from Routines.Yield.wait(500)
+                continue
+
             loot_array = LootFilters().GetLootArray(Range.Earshot.value)
             if len(loot_array) == 0:
                 yield from Routines.Yield.wait(500)
