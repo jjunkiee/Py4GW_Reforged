@@ -1372,7 +1372,7 @@ class InventoryPlusWidget:
     def load_auto_handler_settings(self):
         self.auto_inventory_handler.module_active = self._ini_get_bool(section="AutoManager", var_name="module_active", default=False)
         self.auto_inventory_handler._LOOKUP_TIME = self._ini_get_int(section="AutoManager", var_name="lookup_time", default=15000)
-                self.auto_inventory_handler.debug_item_selection = self._ini_get_bool(
+        self.auto_inventory_handler.debug_item_selection = self._ini_get_bool(
             section="AutoManager", var_name="debug_item_selection", default=False
         )
 
