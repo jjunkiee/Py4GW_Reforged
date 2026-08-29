@@ -471,6 +471,7 @@ SALVAGE_KIT_MODEL_ID = int(ModelID.Salvage_Kit.value)
 ID_KIT_MODEL_IDS: tuple[int, ...] = (
     int(ModelID.Identification_Kit.value),
     int(ModelID.Superior_Identification_Kit.value),
+    int(ModelID.Infinite_Identification_Kit.value),
 )
 NORMAL_SALVAGE_KIT_MODEL_IDS: tuple[int, ...] = (
     int(ModelID.Salvage_Kit.value),
@@ -480,6 +481,7 @@ UPGRADE_SALVAGE_KIT_MODEL_IDS: tuple[int, ...] = (
     int(ModelID.Perfect_Salvage_Kit.value),
     int(ModelID.Expert_Salvage_Kit.value),
     int(ModelID.Superior_Salvage_Kit.value),
+    int(ModelID.Infinite_Superior_Salvage_Kit.value),
 )
 SUPPORTED_SALVAGE_KIT_MODEL_IDS: tuple[int, ...] = (
     *NORMAL_SALVAGE_KIT_MODEL_IDS,
@@ -491,6 +493,7 @@ SALVAGE_KIT_MODEL_LABELS: dict[int, str] = {
     int(ModelID.Expert_Salvage_Kit.value): "Expert Salvage Kit",
     int(ModelID.Superior_Salvage_Kit.value): "Superior Salvage Kit",
     int(ModelID.Perfect_Salvage_Kit.value): "Perfect Salvage Kit",
+    int(ModelID.Infinite_Superior_Salvage_Kit.value): "Infinite Superior Salvage Kit",
 }
 EMBARK_BEACH_MAP_ID = 857
 MATERIAL_BATCH_SIZE = 10
