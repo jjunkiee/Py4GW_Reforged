@@ -242,11 +242,22 @@ class Inventory:
         Returns:
             int: The Item ID of the ID Kit with the lowest uses, or 0 if no ID Kit is found.
         """
+        from .enums_src.Model_enums import ModelID
+        id_kit_model_ids = (
+            ModelID.Identification_Kit,
+            ModelID.Superior_Identification_Kit,
+            ModelID.Infinite_Identification_Kit,
+        )
         bags_to_check = ItemArray.CreateBagList(1,2,3,4)
         item_array = ItemArray.GetItemArray(bags_to_check)
-        # Filter to find items that are ID Kits using Item.Usage.IsIDKit
-        id_kits = ItemArray.Filter.ByCondition(item_array, Item.Usage.IsIDKit)
-        
+        # Filter to find items that are ID Kits using Item.Usage.IsIDKit, with a model-ID
+        # fallback so kits the native flag does not classify (e.g. Infinite Identification Kit)
+        # are still recognised.
+        id_kits = ItemArray.Filter.ByCondition(
+            item_array,
+            lambda item_id: Item.Usage.IsIDKit(item_id) or Item.GetModelID(item_id) in id_kit_model_ids,
+        )
+
         if not id_kits:
             return 0  # Return 0 if no ID Kit is found
         # Sort the ID Kits by remaining uses using Item.Usage.GetUses and get the one with the lowest uses

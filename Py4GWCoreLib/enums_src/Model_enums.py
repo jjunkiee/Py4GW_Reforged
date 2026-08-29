@@ -1365,6 +1365,8 @@ class ModelID(IntEnum):
     Inscriptions_Spellcasting = 19122
     Insect_Appendage = 1597
     Insect_Carapace = 1617
+    Infinite_Identification_Kit = 38620
+    Infinite_Superior_Salvage_Kit = 38621
     Intricate_Grawl_Necklace = 499
     Iridescent_Griffon_Wing = 453
     Iron_Ingot = 948

@@ -221,9 +221,9 @@ class AutoInventoryHandler():
         for item in self._get_inventory_items():
             if not item.is_salvage_kit or item.uses <= 0:
                 continue
-            if item.model_id == ModelID.Salvage_Kit:
+            if item.model_id in (ModelID.Salvage_Kit, ModelID.Salvage_Kit_preSearing):
                 capabilities["lesser"] = True
-            elif item.model_id in (ModelID.Expert_Salvage_Kit, ModelID.Superior_Salvage_Kit):
+            elif item.model_id in (ModelID.Expert_Salvage_Kit, ModelID.Superior_Salvage_Kit, ModelID.Infinite_Superior_Salvage_Kit):
                 capabilities["expert"] = True
                 capabilities["upgrade"] = True
             elif item.model_id == ModelID.Perfect_Salvage_Kit:

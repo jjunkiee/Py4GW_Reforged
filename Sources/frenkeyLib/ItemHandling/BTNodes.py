@@ -727,7 +727,7 @@ class BTNodes:
                     return 0
 
                 preferred = ItemSnapshot.from_item_id(preferred_kit_id)
-                if preferred is None or not preferred.is_valid or not preferred.is_salvage_kit or preferred.uses <= 0:
+                if preferred is None or not preferred.is_valid or preferred.uses <= 0:
                     return 0
 
                 try:
@@ -735,15 +735,17 @@ class BTNodes:
                 except ValueError:
                     return 0
 
-                return preferred.id if preferred_model_id in valid_model_ids else 0
+                if preferred_model_id not in valid_model_ids:
+                    return 0
+                return preferred.id
 
             def _get_expert_salvage_kit() -> int:
-                preferred = _resolve_preferred_kit((ModelID.Expert_Salvage_Kit, ModelID.Superior_Salvage_Kit))
+                preferred = _resolve_preferred_kit((ModelID.Expert_Salvage_Kit, ModelID.Superior_Salvage_Kit, ModelID.Infinite_Superior_Salvage_Kit))
                 if preferred > 0:
                     return preferred
 
                 inventory_snapshot = ItemSnapshot.get_inventory_snapshot(Bag.Backpack, Bag.Bag_2)
-                expert_kits = [i for bag in inventory_snapshot.values() for i in bag.values() if i is not None and i.is_valid and i.is_salvage_kit and i.model_id in (ModelID.Expert_Salvage_Kit, ModelID.Superior_Salvage_Kit)]
+                expert_kits = [i for bag in inventory_snapshot.values() for i in bag.values() if i is not None and i.is_valid and i.model_id in (ModelID.Expert_Salvage_Kit, ModelID.Superior_Salvage_Kit, ModelID.Infinite_Superior_Salvage_Kit)]
                 
                 if not expert_kits:
                     return 0
@@ -762,7 +764,6 @@ class BTNodes:
                     for item in bag.values()
                     if item is not None
                     and item.is_valid
-                    and item.is_salvage_kit
                     and item.model_id in lesser_kit_model_ids
                 ]
                 
@@ -772,17 +773,18 @@ class BTNodes:
                 return min(lesser_kits, key=lambda k: k.uses).id
 
             def _get_upgrade_salvage_kit() -> int:
-                preferred = _resolve_preferred_kit((ModelID.Perfect_Salvage_Kit, ModelID.Expert_Salvage_Kit, ModelID.Superior_Salvage_Kit))
+                preferred = _resolve_preferred_kit((ModelID.Perfect_Salvage_Kit, ModelID.Expert_Salvage_Kit, ModelID.Superior_Salvage_Kit, ModelID.Infinite_Superior_Salvage_Kit))
                 if preferred > 0:
                     return preferred
 
                 inventory_snapshot = ItemSnapshot.get_inventory_snapshot(Bag.Backpack, Bag.Bag_2)
                 upgrade_kits = [
                     i for bag in inventory_snapshot.values() for i in bag.values()
-                    if i is not None and i.is_valid and i.is_salvage_kit and i.model_id in (
+                    if i is not None and i.is_valid and i.model_id in (
                         ModelID.Perfect_Salvage_Kit,
                         ModelID.Expert_Salvage_Kit,
                         ModelID.Superior_Salvage_Kit,
+                        ModelID.Infinite_Superior_Salvage_Kit,
                     )
                 ]
 
