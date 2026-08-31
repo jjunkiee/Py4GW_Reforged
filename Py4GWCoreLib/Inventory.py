@@ -518,26 +518,82 @@ class Inventory:
         return visible_entries_by_parent
 
     @staticmethod
-    def _collect_frame_text(frame_id: int, children_map: dict[int, list[int]] | None = None, max_depth: int = 1) -> str:
-        """Do not decode arbitrary option-subtree frames as text labels.
+    def _collect_frame_text(
+        frame_id: int,
+        children_map: dict[int, list[int]] | None = None,
+        max_depth: int = 1,
+        text_source: str = "decoded",
+    ) -> str:
+        """Text of a frame and, up to `max_depth`, its descendants.
 
-        The native text-label binding only accepts actual text-label frames. Salvage option
-        subtrees also contain generic containers and button frames, and decoding those can
-        dereference an invalid native type. Callers deliberately use the established option-order
-        fallback when text is unavailable.
+        DANGER - `text_source="decoded"` calls the native decoder
+        (`get_text_label_decoded_by_frame_id`) on every frame in the walk,
+        including container frames that carry no text label at all.  On the
+        salvage choice dialog that is fatal: the client dies inside the decode,
+        taking the whole process with it, and no Python handler can catch it -
+        `Frame.text()` wraps the call in try/except, which is useless against a
+        native crash.  Callers walking frames they did not create should pass
+        `"none"` (structure only) or `"encoded"` (raw label bytes, no decoder).
         """
-        _ = frame_id, children_map, max_depth
-        return ""
+        from collections import deque
+        from .FrameTree import Frame
+
+        collected_text: list[str] = []
+        queued_frames = deque([(frame_id, 0)])
+        visited_frames: set[int] = set()
+
+        while queued_frames:
+            current_frame_id, depth = queued_frames.popleft()
+            if current_frame_id in visited_frames:
+                continue
+            visited_frames.add(current_frame_id)
+
+            # The old version probed eight attribute names (text/label/caption/...)
+            # that UIFrame does not expose, so it always collected nothing.  The
+            # frame's text comes from the decoded text label.
+            if text_source == "none":
+                value = ""
+            elif text_source == "encoded":
+                value = Frame.from_id(current_frame_id).encoded()
+            else:
+                value = Frame.from_id(current_frame_id).text()
+            normalized_text = " ".join(value.split()).strip()
+            if normalized_text and normalized_text not in collected_text:
+                collected_text.append(normalized_text)
+
+            if children_map is None or depth >= max_depth:
+                continue
+
+            for child_frame_id in children_map.get(current_frame_id, []):
+                queued_frames.append((child_frame_id, depth + 1))
+
+        return " | ".join(collected_text)
 
     @staticmethod
     def _collect_salvage_choice_option_text(
         frame_ids: list[int],
         children_map: dict[int, list[int]] | None = None,
         max_depth: int = 2,
+        text_source: str = "none",
     ) -> str:
+        """Option-row text for the salvage choice dialog.
+
+        Defaults to reading nothing.  The native text decoder kills the client
+        on these frames (see `_collect_frame_text`), and the option chooser
+        already falls back to the dialog's visible order, which is stable:
+        upgrade rows first, crafting materials last.  Losing keyword matching
+        costs accuracy in ambiguous cases; calling the decoder costs the whole
+        process.  Pass `"encoded"` or `"decoded"` only from a diagnostic that
+        expects to crash.
+        """
         collected_text: list[str] = []
         for frame_id in frame_ids:
-            frame_text = Inventory._collect_frame_text(frame_id, children_map=children_map, max_depth=max_depth)
+            frame_text = Inventory._collect_frame_text(
+                frame_id,
+                children_map=children_map,
+                max_depth=max_depth,
+                text_source=text_source,
+            )
             for text_part in frame_text.split(" | "):
                 normalized_text = " ".join(text_part.split()).strip()
                 if normalized_text and normalized_text not in collected_text:

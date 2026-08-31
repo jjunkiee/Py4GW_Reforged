@@ -598,15 +598,18 @@ class AutoInventoryHandler():
             
             
     def IDAndSalvageItems(self, progress_callback: Optional[Callable[[float], None]] = None):
-        return
-
-        self.status = "Identifying"
-        yield from self.IdentifyItems()
-        if progress_callback:
-            progress_callback(0.5)
-        self.status = "Salvaging"
-        yield from self.SalvageItems()
-        self.status = "Idle"
+        try:
+            self.status = "Identifying"
+            yield from self.IdentifyItems()
+            if progress_callback:
+                progress_callback(0.5)
+            self.status = "Salvaging"
+            yield from self.SalvageItems()
+        finally:
+            # A pass that dies partway used to leave status pinned at
+            # "Salvaging", and every later Run Now click was then refused with
+            # "handler is busy" until the widget was reloaded.
+            self.status = "Idle"
         yield
         
     def IDSalvageDepositItems(self):
