@@ -16,6 +16,7 @@ The NavMesh snap machinery is ported from ``Mission Map +`` with ``mm`` replaced
 
 import math
 from typing import Optional
+from typing import cast
 
 import PyImGui
 import PySystem
@@ -26,7 +27,6 @@ from Py4GWCoreLib import GLOBAL_CACHE
 from Py4GWCoreLib import Map
 from Py4GWCoreLib import Player
 from Py4GWCoreLib import Routines
-from Py4GWCoreLib import Timer
 from Py4GWCoreLib.BottingTree import BottingTree
 from Py4GWCoreLib.Pathing import NavMesh
 from Py4GWCoreLib.py4gwcorelib_src.BehaviorTree import BehaviorTree
@@ -41,8 +41,11 @@ MODULE_NAME = "Map Overlay"
 
 _SNAP_ARRIVAL_RADIUS = 200.0
 _SNAP_WAYPOINT_RADIUS = 140.0
-_SNAP_RESUME_REISSUE_MS = 1000
 _TARGET_HIT_PAD = 3.0
+
+# A right-click is a human asking for a route now, not a bot replaying a fixed one, so
+# the overlay opts into the periodic refresh that bots keep switched off until measured.
+_SNAP_REPLAN_INTERVAL_MS = 8000
 
 
 # ── snap coroutines (take the Interaction instance) ──────────────────────────────────────
@@ -93,7 +96,12 @@ def _snap_launch_bt_move_coroutine(goal_x: float, goal_y: float, it: "Interactio
     it.snap_move_running = True
     move_tree = None
     try:
-        move_tree = RoutinesBT.Movement.Move(goal_x, goal_y, log=False)
+        move_tree = RoutinesBT.Movement.Move(
+            goal_x,
+            goal_y,
+            log=False,
+            replan_interval_ms=_SNAP_REPLAN_INTERVAL_MS,
+        )
         it.snap_bt_move_tree = move_tree
         while generation == it.snap_move_generation:
             pause_for_danger = it._snap_is_danger_nearby()
@@ -101,7 +109,10 @@ def _snap_launch_bt_move_coroutine(goal_x: float, goal_y: float, it: "Interactio
             if pause_for_danger != it.snap_paused_for_danger:
                 it.snap_paused_for_danger = pause_for_danger
             state = BehaviorTree.Node._normalize_state(move_tree.tick())
-            if state in (RoutinesBT.NodeState.SUCCESS, RoutinesBT.NodeState.FAILURE):
+            if state == RoutinesBT.NodeState.FAILURE:
+                it._snap_on_move_failed(generation)
+                break
+            if state == RoutinesBT.NodeState.SUCCESS:
                 break
             yield from Routines.Yield.wait(100)
     except Exception as e:
@@ -161,14 +172,11 @@ class Interaction:
         self.snap_current_path: list[tuple[float, float]] = []
         self.snap_path_computing: bool = False
         self.snap_path_index: int = 0
-        self.snap_path_following: bool = False
         self.snap_move_generation: int = 0
         self.snap_move_running: bool = False
         self.snap_paused_for_danger: bool = False
         self.snap_bt_move_tree: Optional[BehaviorTree] = None
         self.snap_bt_draw_helper = BottingTree("Map Overlay Snap Draw")
-        self.snap_move_retry_timer = Timer()
-        self.snap_move_retry_timer.Start()
 
     @property
     def snap_active(self) -> bool:
@@ -191,6 +199,54 @@ class Interaction:
         bb["move_path_count"] = 0
         bb["move_current_waypoint"] = None
         bb["move_current_waypoint_index"] = -1
+        bb["move_skipped_waypoints"] = 0
+        bb["move_target_selection_reason"] = ""
+        bb["move_replan_count"] = 0
+        bb["move_replan_reason"] = ""
+        bb["move_replanning"] = False
+
+    def _snap_on_move_failed(self, generation: int) -> None:
+        """Drop the navigation when the move tree gives up.
+
+        `snap_active` keys off `snap_snapped_target`, so leaving it set after a
+        failure left the overlay reporting a live navigation and drawing a route
+        that nothing was walking.
+        """
+        if generation != self.snap_move_generation:
+            return
+        reason = ""
+        if self.snap_bt_move_tree is not None:
+            reason = str(self.snap_bt_move_tree.blackboard.get("move_reason", ""))
+        target = self.snap_snapped_target
+        dropped = len(self.snap_target_queue)
+        self.snap_clear()
+        target_text = f"({target[0]:.1f}, {target[1]:.1f})" if target is not None else "the snapped target"
+        queue_text = f" {dropped} queued waypoint(s) dropped." if dropped > 0 else ""
+        PySystem.Console.Log(
+            MODULE_NAME,
+            f"Snap movement to {target_text} failed ({reason or 'unknown'}); navigation cleared.{queue_text}",
+            PySystem.Console.MessageType.Warning,
+        )
+
+    def _sync_path_from_move_tree(self) -> None:
+        """Track the route the mover is actually following.
+
+        The click-time path coroutine fills `snap_current_path` once, so without
+        this the 2D overlay would keep drawing a route the move tree has already
+        replanned away from.
+        """
+        if self.snap_bt_move_tree is None or self.snap_path_computing:
+            return
+        source = self.snap_bt_move_tree.blackboard
+        if str(source.get("move_state", "")) not in ("running", "paused"):
+            return
+        points = source.get("move_path_points", [])
+        if not isinstance(points, list) or len(points) == 0:
+            return
+        # The blackboard is untyped; Move publishes this key as a list of 2D points.
+        route = cast("list[tuple[float, float]]", points)
+        self.snap_current_path = [(float(point_x), float(point_y)) for point_x, point_y in route]
+        self.snap_path_index = int(source.get("move_path_index", 0) or 0)
 
     def _snap_is_danger_nearby(self) -> bool:
         if not self.cfg.snap.pause_on_danger:
@@ -213,8 +269,6 @@ class Interaction:
         self.snap_current_path = []
         self._clear_snap_bt_draw_state()
         self.snap_path_index = 0
-        self.snap_path_following = False
-        self.snap_move_retry_timer.Reset()
         GLOBAL_CACHE.Coroutines.append(_snap_launch_path_coroutine(snapped_target[0], snapped_target[1], self))
         GLOBAL_CACHE.Coroutines.append(_snap_launch_bt_move_coroutine(snapped_target[0], snapped_target[1], self, move_generation))
 
@@ -231,8 +285,6 @@ class Interaction:
         self.snap_current_path = []
         self._clear_snap_bt_draw_state()
         self.snap_path_index = 0
-        self.snap_path_following = False
-        self.snap_move_retry_timer.Reset()
         px, py = Player.GetXY()
         Player.Move(px, py)
 
@@ -263,6 +315,7 @@ class Interaction:
             else:
                 self.snap_clear()
 
+        self._sync_path_from_move_tree()
         self._advance_arrival()
 
     def _target_nearest(self, mx: float, my: float) -> None:
@@ -338,6 +391,13 @@ class Interaction:
                 bb["move_path_count"] = int(src_bb.get("move_path_count", len(src_points_raw)) or len(src_points_raw))
                 bb["move_current_waypoint"] = src_bb.get("move_current_waypoint")
                 bb["move_current_waypoint_index"] = int(src_bb.get("move_current_waypoint_index", -1) or -1)
+                # The mirror is a fixed whitelist, so the follower diagnostics only become
+                # visible to blackboard consumers if they are copied across explicitly.
+                bb["move_skipped_waypoints"] = int(src_bb.get("move_skipped_waypoints", 0) or 0)
+                bb["move_target_selection_reason"] = str(src_bb.get("move_target_selection_reason", ""))
+                bb["move_replan_count"] = int(src_bb.get("move_replan_count", 0) or 0)
+                bb["move_replan_reason"] = str(src_bb.get("move_replan_reason", ""))
+                bb["move_replanning"] = bool(src_bb.get("move_replanning", False))
                 self.snap_bt_draw_helper.DrawMovePath(draw_labels=False, path_thickness=3.0,
                                                       waypoint_radius=15.0, current_waypoint_radius=20.0)
                 return

@@ -72,6 +72,16 @@ from ...enums_src.UI_enums import ControlAction
 from .local_avoidance import CircularObstacle
 from .local_avoidance import choose_avoidance_target
 from .local_avoidance import find_first_blocker
+from .path_following import REASON_DISC
+from .path_following import REASON_SKIP_STALL
+from .path_following import REPLAN_REASON_INTERVAL
+from .path_following import REPLAN_REASON_OFF_PATH
+from .path_following import REPLAN_REASON_STALL
+from .path_following import replan_budget_exhausted
+from .path_following import replan_spacing_elapsed
+from .path_following import select_target
+from .path_following import should_replan_interval
+from .path_following import should_replan_off_path
 
 
 
@@ -84,6 +94,25 @@ def _fail_log(source: str, message: str, message_type=Console.MessageType.Warnin
 
 
 DEFAULT_MOVE_TOLERANCE = 150.0
+
+# Intermediate waypoints are route hints, not destinations, so they get their own
+# arrival budget instead of inheriting the caller's destination precision.
+DEFAULT_WAYPOINT_TOLERANCE = 150.0
+DEFAULT_WAYPOINT_CORRIDOR_RATIO = 1.5
+DEFAULT_WAYPOINT_LOOKAHEAD_NODES = 3
+STALL_SKIP_RETRY_THRESHOLD = 2
+MAX_CONSECUTIVE_STALL_SKIPS = 2
+SKIP_REACHABILITY_MARGIN = 100.0
+SKIP_REACHABILITY_STEP_DIST = 100.0
+
+# A route is a snapshot of what was known when it was planned, so the follower can
+# ask for a fresh one mid-move. Every replan hands the timeout watcher a fresh
+# budget, which is why the count of consecutive fruitless replans is what keeps an
+# impossible destination bounded rather than the timeout alone.
+PATH_REQUEST_MARGIN = 250.0
+DEFAULT_REPLAN_OFF_PATH_DISTANCE = 500.0
+MAX_CONSECUTIVE_REPLANS = 2
+REPLAN_MIN_INTERVAL_MS = 2000
 
 class BTMovement:
     """
@@ -168,6 +197,15 @@ class BTMovement:
         avoidance_logged_ignored_target_ids: set[int]
         combat_release_pending: bool
         combat_release_started_ms: int | None
+        skipped_waypoints: int
+        target_selection_reason: str
+        stall_skip_streak: int
+        replan_gen: Any | None
+        replan_reason: str
+        replan_count: int
+        replan_streak: int
+        last_replan_ms: int | None
+        path_acquired_ms: int | None
         
     #region Move
     @staticmethod
@@ -195,6 +233,13 @@ class BTMovement:
         ignore_destination_gadgets: bool = True,
         combat_release_delay_ms: int = 0,
         pause_on_nearby_enemy_range: float = 0.0,
+        *,
+        waypoint_tolerance: float | None = None,
+        waypoint_corridor_half_width: float | None = None,
+        waypoint_lookahead_nodes: int = DEFAULT_WAYPOINT_LOOKAHEAD_NODES,
+        replan_on_stall: bool = True,
+        replan_off_path_distance: float = DEFAULT_REPLAN_OFF_PATH_DISTANCE,
+        replan_interval_ms: int = 0,
     ) -> BehaviorTree:
         """
         Build a tree that moves the player to target coordinates using autopathing, proactive local avoidance, and runtime recovery logic.
@@ -205,7 +250,7 @@ class BTMovement:
             Display: Move
             Purpose: Move the player to target coordinates with waypoint tracking, local obstacle avoidance, pause handling, and timeout protection.
             UserDescription: Use this when you want a robust movement routine that can steer around nearby agents and collidable gadget candidates, pause, recover, and report progress through the blackboard.
-            Notes: Writes movement and avoidance state to the blackboard and uses a parallel runtime with move, timeout, and map-transition watchers. Interaction composites may independently ignore NPCs or gadgets near the final destination during a bounded approach while retaining avoidance for all other obstacles.
+            Notes: Writes movement and avoidance state to the blackboard and uses a parallel runtime with move, timeout, and map-transition watchers. Interaction composites may independently ignore NPCs or gadgets near the final destination during a bounded approach while retaining avoidance for all other obstacles. Intermediate waypoints are route hints: they clear on `waypoint_tolerance` or on a corridor look-ahead, and a stalled one is skipped, while the caller's `tolerance` still governs arrival at the destination. The route itself can be replanned mid-move when the stuck ladder is exhausted, when a pause left the player further than `replan_off_path_distance` from the remaining route, or every `replan_interval_ms` when that is enabled; the route in hand keeps being followed until the replacement resolves.
         """
         resolved_destination_obstacle_position: Point2D = (
             (
@@ -215,6 +260,17 @@ class BTMovement:
             if destination_obstacle_position is not None
             else (float(x), float(y))
         )
+        intermediate_tolerance: float = (
+            max(float(tolerance), DEFAULT_WAYPOINT_TOLERANCE)
+            if waypoint_tolerance is None
+            else max(1.0, float(waypoint_tolerance))
+        )
+        corridor_half_width: float = (
+            intermediate_tolerance * DEFAULT_WAYPOINT_CORRIDOR_RATIO
+            if waypoint_corridor_half_width is None
+            else max(1.0, float(waypoint_corridor_half_width))
+        )
+        lookahead_nodes: int = max(0, int(waypoint_lookahead_nodes))
         state: BTMovement._MoveState = {
             "path_gen": None,
             "path_points": None,
@@ -256,6 +312,15 @@ class BTMovement:
             "avoidance_logged_ignored_target_ids": set(),
             "combat_release_pending": bool(pause_on_combat and int(combat_release_delay_ms) > 0),
             "combat_release_started_ms": None,
+            "skipped_waypoints": 0,
+            "target_selection_reason": "",
+            "stall_skip_streak": 0,
+            "replan_gen": None,
+            "replan_reason": "",
+            "replan_count": 0,
+            "replan_streak": 0,
+            "last_replan_ms": None,
+            "path_acquired_ms": None,
         }
 
         def _reset_runtime() -> None:
@@ -307,6 +372,15 @@ class BTMovement:
             state["avoidance_logged_ignored_target_ids"] = set()
             state["combat_release_pending"] = bool(pause_on_combat and int(combat_release_delay_ms) > 0)
             state["combat_release_started_ms"] = None
+            state["skipped_waypoints"] = 0
+            state["target_selection_reason"] = ""
+            state["stall_skip_streak"] = 0
+            state["replan_gen"] = None
+            state["replan_reason"] = ""
+            state["replan_count"] = 0
+            state["replan_streak"] = 0
+            state["last_replan_ms"] = None
+            state["path_acquired_ms"] = None
 
         def _reset_result() -> None:
             """
@@ -377,6 +451,11 @@ class BTMovement:
             node.blackboard["move_avoidance_target"] = state["avoidance_target"]
             node.blackboard["move_avoidance_blocker_id"] = int(state["avoidance_blocker_id"])
             node.blackboard["move_avoidance_side"] = int(state["avoidance_side"])
+            node.blackboard["move_skipped_waypoints"] = int(state["skipped_waypoints"])
+            node.blackboard["move_target_selection_reason"] = state["target_selection_reason"]
+            node.blackboard["move_replan_count"] = int(state["replan_count"])
+            node.blackboard["move_replan_reason"] = state["replan_reason"]
+            node.blackboard["move_replanning"] = state["replan_gen"] is not None
 
         def _debug_enabled(node: BehaviorTree.Node) -> bool:
             """
@@ -806,6 +885,26 @@ class BTMovement:
             except Exception:
                 return False
 
+        def _is_skip_reachable(start: Point2D, end: Point2D) -> bool:
+            """Reject a look-ahead skip whose target static geometry cannot reach directly."""
+            from ...Pathing import AutoPathing
+
+            navmesh = AutoPathing().get_navmesh()
+            if navmesh is None:
+                return True
+
+            try:
+                return bool(
+                    navmesh.has_line_of_sight(
+                        start,
+                        end,
+                        margin=SKIP_REACHABILITY_MARGIN,
+                        step_dist=SKIP_REACHABILITY_STEP_DIST,
+                    )
+                )
+            except Exception:
+                return False
+
         def _tick_local_avoidance(
             node: BehaviorTree.Node,
             current_pos: Point2D,
@@ -991,6 +1090,125 @@ class BTMovement:
             _stop_strafe()
             return False
 
+        def _request_replan(node: BehaviorTree.Node, reason: str, now: int) -> bool:
+            """
+            Ask for a fresh route to the destination without ending the move.
+
+            Meta:
+                Expose: false
+                Audience: advanced
+                Display: Internal Request Replan Helper
+                Purpose: Start a path request that replaces the current route once it resolves.
+                UserDescription: Internal support routine.
+                Notes: Refuses while a replan is already in flight, inside the minimum spacing window, or once consecutive fruitless replans are exhausted. A caller-supplied path is never replanned.
+            """
+            if path_points_override is not None:
+                return False
+            if state["replan_gen"] is not None:
+                return False
+            if not replan_spacing_elapsed(now, state["last_replan_ms"], min_interval_ms=REPLAN_MIN_INTERVAL_MS):
+                return False
+            if replan_budget_exhausted(state["replan_streak"], max_replans=MAX_CONSECUTIVE_REPLANS):
+                return False
+
+            from ...Pathing import AutoPathing
+
+            state["replan_gen"] = AutoPathing().get_path_to(x, y, margin=PATH_REQUEST_MARGIN)
+            state["replan_reason"] = reason
+            state["last_replan_ms"] = now
+            state["replan_count"] += 1
+            state["replan_streak"] += 1
+            if _debug_enabled(node):
+                _log(
+                    "Move",
+                    (
+                        f"Replanning route to ({x}, {y}) because of {reason} "
+                        f"(replan {state['replan_count']}, streak {state['replan_streak']})."
+                    ),
+                    message_type=Console.MessageType.Info,
+                    log=True,
+                )
+            return True
+
+        def _adopt_replan(node: BehaviorTree.Node, points: list[Point2D], now: int) -> None:
+            """
+            Swap a resolved replan in as the route being followed.
+
+            Meta:
+                Expose: false
+                Audience: advanced
+                Display: Internal Adopt Replan Helper
+                Purpose: Replace the tracked path with a freshly planned one and restart per-waypoint bookkeeping.
+                UserDescription: Internal support routine.
+                Notes: A replan that resolves to nothing leaves the current route in place; it is a failed refresh, not a failed move.
+            """
+            resolved: list[Point2D] = [(float(point_x), float(point_y)) for point_x, point_y in points]
+            state["replan_gen"] = None
+            if not resolved:
+                state["last_progress_ms"] = now
+                if _debug_enabled(node):
+                    _log(
+                        "Move",
+                        f"Replan ({state['replan_reason']}) returned no path; keeping the current route.",
+                        message_type=Console.MessageType.Warning,
+                        log=True,
+                    )
+                return
+
+            _stop_strafe()
+            _clear_avoidance()
+            state["path_points"] = resolved
+            state["path_index"] = 0
+            state["path_acquired_ms"] = now
+            state["move_issued"] = False
+            state["last_distance"] = None
+            state["last_progress_ms"] = now
+            state["last_move_point"] = None
+            state["last_logged_waypoint_index"] = -1
+            state["stall_retry_count"] = 0
+            state["stall_skip_streak"] = 0
+            state["strafe_side"] = ""
+            state["strafe_phase"] = 0
+            # A fresh route deserves a fresh timeout budget; the timeout watcher consumes this.
+            state["resume_recovery_restart_pending"] = True
+            if _debug_enabled(node):
+                _log(
+                    "Move",
+                    f"Replan ({state['replan_reason']}) resolved with {len(resolved)} points to ({x}, {y}).",
+                    message_type=Console.MessageType.Info,
+                    log=True,
+                )
+
+        def _tick_replan(node: BehaviorTree.Node, now: int) -> None:
+            """
+            Advance an in-flight replan and adopt it when it resolves.
+
+            Meta:
+                Expose: false
+                Audience: advanced
+                Display: Internal Tick Replan Helper
+                Purpose: Drive the replan path generator without disturbing the route currently being followed.
+                UserDescription: Internal support routine.
+                Notes: Deliberately does not own the tick. The route already in hand keeps being followed, published, and drawn while the replacement computes, so a refresh never stops the character or suspends local avoidance.
+            """
+            replan_gen = state["replan_gen"]
+            if replan_gen is None:
+                return
+
+            try:
+                next(replan_gen)
+            except StopIteration as path_result:
+                _adopt_replan(node, list(path_result.value or []), now)
+            except Exception as replan_error:
+                state["replan_gen"] = None
+                state["last_progress_ms"] = now
+                _log(
+                    "Move",
+                    f"Replan ({state['replan_reason']}) failed: {replan_error}",
+                    message_type=Console.MessageType.Warning,
+                    log=True,
+                )
+
         def _move(node: BehaviorTree.Node) -> BehaviorTree.NodeState:
             """
             Drive the main movement execution loop.
@@ -1020,7 +1238,10 @@ class BTMovement:
 
             if state["path_gen"] is None and state["path_points"] is None:
                 _reset_result()
-                state["initial_map_id"] = Map.GetMapID()
+                # Only the first acquisition owns this: a replan must not re-stamp it, or the
+                # map-transition watcher loses the map the move started on.
+                if state["initial_map_id"] is None:
+                    state["initial_map_id"] = Map.GetMapID()
                 if path_points_override is not None:
                     state["path_gen"] = None
                     state["path_points"] = [
@@ -1028,6 +1249,7 @@ class BTMovement:
                         for path_x, path_y in path_points_override
                     ]
                     state["path_index"] = 0
+                    state["path_acquired_ms"] = now
                     state["move_issued"] = False
                     state["last_distance"] = None
                     state["last_progress_ms"] = now
@@ -1042,7 +1264,7 @@ class BTMovement:
                         )
                     _set_blackboard(node, "running")
                 else:
-                    state["path_gen"] = AutoPathing().get_path_to(x, y, margin=250)
+                    state["path_gen"] = AutoPathing().get_path_to(x, y, margin=PATH_REQUEST_MARGIN)
                     if _debug_enabled(node):
                         _log("Move", f"Starting autopath to ({x}, {y}).", message_type=Console.MessageType.Info, log=True)
                     _set_blackboard(node, "running")
@@ -1056,6 +1278,7 @@ class BTMovement:
                     state["path_points"] = list(path_result.value or [])
                     state["path_gen"] = None
                     state["path_index"] = 0
+                    state["path_acquired_ms"] = now
                     state["move_issued"] = False
                     state["last_distance"] = None
                     state["last_progress_ms"] = now
@@ -1163,6 +1386,18 @@ class BTMovement:
                 state["last_distance"] = None
                 state["last_progress_ms"] = now
                 state["last_move_point"] = None
+                # A detour that left the corridor entirely is past what look-ahead can
+                # rescue, so ask for a route from where the player actually ended up.
+                resume_path_points: list[Point2D] = state["path_points"] or []
+                if resume_path_points and should_replan_off_path(
+                    Player.GetXY(),
+                    resume_path_points,
+                    state["path_index"],
+                    threshold=float(replan_off_path_distance),
+                ):
+                    _request_replan(node, REPLAN_REASON_OFF_PATH, now)
+
+            _tick_replan(node, now)
 
             if state["path_points"] is None or state["path_index"] >= len(state["path_points"]):
                 if log:
@@ -1172,6 +1407,11 @@ class BTMovement:
 
             if _tick_avoidance_navmesh(node):
                 return BehaviorTree.NodeState.RUNNING
+
+            if should_replan_interval(now, state["path_acquired_ms"], interval_ms=int(replan_interval_ms)):
+                # Requested, not awaited: the route in hand stays followed until the
+                # replacement resolves, so a refresh never stops the character.
+                _request_replan(node, REPLAN_REASON_INTERVAL, now)
 
             target_x, target_y = state["path_points"][state["path_index"]]
             if state["last_logged_waypoint_index"] != state["path_index"] and log:
@@ -1185,10 +1425,31 @@ class BTMovement:
             current_pos: Point2D = Player.GetXY()
             current_distance: float = Utils.Distance(current_pos, (target_x, target_y))
 
-            if current_distance <= effective_tolerance:
+            path_points: list[Point2D] = state["path_points"] or []
+            is_final_waypoint: bool = state["path_index"] >= len(path_points) - 1
+            selection = select_target(
+                current_pos,
+                path_points,
+                state["path_index"],
+                tolerance=intermediate_tolerance,
+                corridor_half_width=corridor_half_width,
+                lookahead_nodes=lookahead_nodes,
+                is_reachable=_is_skip_reachable,
+            )
+            reached_destination: bool = is_final_waypoint and current_distance <= effective_tolerance
+
+            if selection.index > state["path_index"] or reached_destination:
                 _stop_strafe()
                 _clear_avoidance()
-                state["path_index"] += 1
+                if reached_destination:
+                    state["path_index"] = len(path_points)
+                    state["target_selection_reason"] = REASON_DISC
+                else:
+                    state["path_index"] = selection.index
+                    state["skipped_waypoints"] += selection.skipped
+                    state["target_selection_reason"] = selection.reason
+                state["stall_skip_streak"] = 0
+                state["replan_streak"] = 0
                 state["move_issued"] = False
                 state["last_distance"] = None
                 state["last_progress_ms"] = now
@@ -1247,6 +1508,8 @@ class BTMovement:
                 state["last_distance"] = current_distance
                 state["last_progress_ms"] = now
                 state["stall_retry_count"] = 0
+                state["stall_skip_streak"] = 0
+                state["replan_streak"] = 0
             elif state["last_progress_ms"] is not None and now - state["last_progress_ms"] >= stall_threshold_ms:
                 state["stall_retry_count"] += 1
                 if log:
@@ -1256,6 +1519,40 @@ class BTMovement:
                         message_type=Console.MessageType.Warning,
                         log=log,
                     )
+                if (
+                    not is_final_waypoint
+                    and state["stall_retry_count"] >= STALL_SKIP_RETRY_THRESHOLD
+                    and state["stall_skip_streak"] < MAX_CONSECUTIVE_STALL_SKIPS
+                ):
+                    _stop_strafe()
+                    _clear_avoidance()
+                    state["path_index"] += 1
+                    state["skipped_waypoints"] += 1
+                    state["stall_skip_streak"] += 1
+                    state["target_selection_reason"] = REASON_SKIP_STALL
+                    state["stall_retry_count"] = 0
+                    state["strafe_side"] = ""
+                    state["strafe_phase"] = 0
+                    state["move_issued"] = False
+                    state["last_distance"] = None
+                    state["last_progress_ms"] = now
+                    skip_x, skip_y = path_points[state["path_index"]]
+                    if log:
+                        _log(
+                            "Move",
+                            (
+                                f"Waypoint ({target_x}, {target_y}) looks unreachable; skipping to index "
+                                f"{state['path_index']} at ({skip_x}, {skip_y})."
+                            ),
+                            message_type=Console.MessageType.Warning,
+                            log=log,
+                        )
+                    if not _try_issue_move(node, skip_x, skip_y, now):
+                        return BehaviorTree.NodeState.RUNNING
+                    state["move_issued"] = True
+                    state["last_distance"] = Utils.Distance(Player.GetXY(), (skip_x, skip_y))
+                    _set_blackboard(node, "running", "skipped_stalled_waypoint")
+                    return BehaviorTree.NodeState.RUNNING
                 if pause_on_combat and state["stall_retry_count"] >= 4:
                     if state["strafe_phase"] == 0:
                         chosen_side = random.choice(("left", "right"))
@@ -1287,6 +1584,23 @@ class BTMovement:
                         state["last_progress_ms"] = now
                         _set_blackboard(node, "running", f"strafing_{opposite_side}")
                         return BehaviorTree.NodeState.RUNNING
+                if replan_on_stall and path_points_override is None and state["replan_gen"] is None:
+                    if _request_replan(node, REPLAN_REASON_STALL, now):
+                        state["last_progress_ms"] = now
+                        _set_blackboard(node, "running", "replanning")
+                        return BehaviorTree.NodeState.RUNNING
+                    if replan_budget_exhausted(state["replan_streak"], max_replans=MAX_CONSECUTIVE_REPLANS):
+                        state["failure_details"] = {
+                            "replan_count": int(state["replan_count"]),
+                            "replan_streak": int(state["replan_streak"]),
+                            "max_consecutive_replans": int(MAX_CONSECUTIVE_REPLANS),
+                            "last_replan_reason": state["replan_reason"],
+                            "current_pos": current_pos,
+                            "current_waypoint": (float(target_x), float(target_y)),
+                            "distance_to_waypoint": float(current_distance),
+                        }
+                        _finalize_move(node, "failed", "replan_exhausted")
+                        return BehaviorTree.NodeState.FAILURE
                 if not _try_issue_move(node, target_x, target_y, now):
                     return BehaviorTree.NodeState.RUNNING
                 state["last_progress_ms"] = now
