@@ -8,3 +8,9 @@ owning Python source, native bindings, and injected-client observations.
   item features into `System Settings > Items & Merchants`; its migration
   journal records the first Colorize/Xunlai slice, verification, and resume
   point.
+- `cross-account-inventory-transfer.md` - drop-and-collect item ferry
+  that consolidates multiboxed inventories in an explorable area instead of
+  running a trade window per pair; records the reuse map, the shared-memory
+  message limits that shape its protocol, the slot/stack budgeting algorithm,
+  and the game-behavior assumptions still awaiting live verification. Its
+  offline planner (phase 1) is implemented; nothing can move an item yet.
