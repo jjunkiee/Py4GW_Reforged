@@ -7,7 +7,7 @@ from ...GlobalCache.WhiteboardLocks import clear_loot_lock, post_loot_lock
 from ...Player import Player
 from ...GlobalCache import GLOBAL_CACHE
 from ...Py4GWcorelib import ConsoleLog, Console, ActionQueueManager
-from ...enums import SharedCommandType
+from ...enums import Range, SharedCommandType
 from ..BehaviourTrees import BT
 from .helpers import _run_bt_tree, wait
 from .movement import Movement
@@ -587,6 +587,153 @@ class Items:
 
         Items._finish_active_pick_up_loot_message()
         return failed_items
+
+    @staticmethod
+    def _wait_for_drop(
+        item_id: int,
+        expected_quantity: int,
+        timeout_ms: int = 2500,
+        poll_ms: int = 50,
+    ) -> Generator[Any, Any, bool]:
+        """Wait until a dropped stack has left the bags.
+
+        PyInventory actions are queued and return None, so the only evidence a drop
+        landed is the item disappearing from the inventory -- or, when the stack grew
+        between the quantity read and the drop, merely shrinking.
+        """
+        waited_ms = 0
+        while waited_ms < timeout_ms:
+            yield from wait(poll_ms)
+            waited_ms += poll_ms
+            if not item_still_present(item_id):
+                return True
+            if item_quantity(item_id) < expected_quantity:
+                return True
+        return False
+
+    @staticmethod
+    def DropItems(
+        item_ids: list[int],
+        log: bool = False,
+        progress_callback: Optional[Callable[[float], None]] = None,
+        drop_timeout: int = 2500,
+        poll_ms: int = 50,
+        explorable_only: bool = True,
+    ) -> Generator[Any, Any, list[int]]:
+        """Drop the given inventory items where the character stands, whole stacks only.
+
+        This is the movement primitive; the caller owns selection and eligibility, the
+        same way LootItems owns no opinion about what it picks up. Each item is dropped
+        with its live quantity so a stack is never split, and each drop is confirmed by
+        polling before the next one is queued.
+
+        Returns the ids observed leaving the bags. Ids missing from that list are still
+        in the inventory. A failed drop does not stop the run: the remaining items may
+        still be droppable.
+        """
+        from ..Checks import Checks
+
+        dropped: list[int] = []
+        total_items = len(item_ids)
+        if total_items == 0:
+            return dropped
+
+        if not Checks.Map.MapValid():
+            return dropped
+
+        if explorable_only and not Checks.Map.IsExplorable():
+            ConsoleLog("DropItems", "Not in an explorable area, dropping nothing.", Console.MessageType.Warning)
+            return dropped
+
+        for index, item_id in enumerate(item_ids):
+            if item_id == 0:
+                continue
+
+            if not Checks.Map.MapValid():
+                ActionQueueManager().ResetAllQueues()
+                ConsoleLog("DropItems", "Map became invalid, stopping.", Console.MessageType.Warning)
+                return dropped
+
+            quantity = item_quantity(item_id)
+            if quantity <= 0:
+                if log:
+                    ConsoleLog("DropItems", f"Item {item_id} is no longer in the bags, skipping.", Console.MessageType.Warning)
+                continue
+
+            GLOBAL_CACHE.Inventory.DropItem(item_id, quantity)
+            left_the_bags = yield from Items._wait_for_drop(item_id, quantity, drop_timeout, poll_ms)
+
+            if not left_the_bags:
+                ConsoleLog(
+                    "DropItems",
+                    f"Item {item_id} did not leave the bags within {drop_timeout} ms.",
+                    Console.MessageType.Warning,
+                )
+            else:
+                dropped.append(item_id)
+                if item_still_present(item_id):
+                    ConsoleLog(
+                        "DropItems",
+                        f"Item {item_id} dropped partially, {item_quantity(item_id)} still in the bags.",
+                        Console.MessageType.Warning,
+                    )
+
+            if progress_callback:
+                progress_callback((index + 1) / total_items)
+
+        if log:
+            ConsoleLog("DropItems", f"Dropped {len(dropped)} of {total_items} items.", Console.MessageType.Info)
+        return dropped
+
+    @staticmethod
+    def LootGroundItems(
+        radius: float = Range.Earshot.value,
+        max_items: int = 0,
+        center: Optional[tuple[float, float]] = None,
+        include_reserved: bool = True,
+        log: bool = False,
+        progress_callback: Optional[Callable[[float], None]] = None,
+        pickup_timeout: int = 5000,
+    ) -> Generator[Any, Any, bool]:
+        """Collect free ground items around a point, nearest first.
+
+        Builds the candidate array -- unowned items, plus items still reserved for this
+        character when include_reserved, which is what a recall needs -- and hands it to
+        LootItems, which owns the loot locks, the movement, and the free-slot bail-out.
+        center defaults to the player position; max_items <= 0 means no cap.
+        """
+        from ...AgentArray import AgentArray
+
+        rally_point = Player.GetXY() if center is None else center
+        own_agent_id = Player.GetAgentID()
+
+        def is_collectable(agent_id: int) -> bool:
+            owner_id = Agent.GetItemAgentOwnerID(agent_id)
+            if owner_id == 0:
+                return True
+            return include_reserved and owner_id == own_agent_id
+
+        item_array: list[int] = AgentArray.GetItemArray()
+        item_array = AgentArray.Filter.ByDistance(item_array, rally_point, radius)
+        item_array = AgentArray.Filter.ByCondition(item_array, is_collectable)
+        item_array = AgentArray.Sort.ByDistance(item_array, rally_point)
+        if max_items > 0:
+            item_array = item_array[:max_items]
+
+        if log:
+            ConsoleLog(
+                "LootGroundItems",
+                f"Collecting {len(item_array)} ground item(s) within {int(radius)} of the rally point.",
+                Console.MessageType.Info,
+            )
+
+        result = yield from Items.LootItems(
+            item_array,
+            log=log,
+            progress_callback=progress_callback,
+            pickup_timeout=pickup_timeout,
+        )
+        return bool(result)
 
     @staticmethod
     def WithdrawItems(model_id:int, quantity:int) -> Generator[Any, Any, bool]:

@@ -1,7 +1,9 @@
 # Cross-Account Inventory Transfer (Drop-and-Collect Ferry)
 
-**Status:** Phase 1 of section 8 (planner + offline tests) is implemented;
-phases 2-6 are still proposed and nothing in this feature can move an item yet.
+**Status:** Phases 1-2 of section 8 (planner, offline tests, yield helpers) are
+implemented; phases 3-6 are still proposed. Nothing coordinates a transfer yet:
+the drop and collect primitives exist, but no command, handler, or widget calls
+them, so this feature still cannot move an item on its own.
 Every game-behavior claim marked *inferred* below remains unverified against a
 live injected client and must be confirmed before the corresponding code is
 trusted. The planner encodes those assumptions as constants and defaults to the
@@ -12,6 +14,13 @@ conservative branch, so it is arithmetically proven and behaviorally unproven.
 passing). Pyright reports zero errors on both files at the project
 configuration and at `strict`. No live-client verification has been run, and
 none of A1-A7 is confirmed.
+
+**Phase 2 landed:** `Items.DropItems` and `Items.LootGroundItems` in
+`Py4GWCoreLib/routines_src/yield_src/items.py`. Pyright at the project
+configuration reports the same two pre-existing `UIManager` errors as the
+unmodified file and no new diagnostics; the phase 1 planner test still passes.
+Neither helper has been run against a live client, so A1, A2, A3, and A5 remain
+unconfirmed.
 
 **Topic owner:** item movement across multiboxed accounts.
 **Related:** `docs/loot/plans/inventory-plus-to-system-settings.md`,
@@ -437,8 +446,17 @@ Each phase is independently reviewable and leaves the tree buildable.
    live read can produce the `allowed` verdict a real `DropItem` requires.
    The module also owns the shared-memory-to-record adapter, so the widget
    does not grow a second conversion.
-2. **Yield helpers.** `Items.DropItems`, `Items.LootGroundItems`. Verify by
-   hand on a single account with a throwaway item.
+2. **Yield helpers.** *Implemented, live verification outstanding.*
+   `Items.DropItems` drops whole stacks where the character stands and confirms
+   each one by polling, because the queued native action cannot report success;
+   it returns the ids observed leaving the bags so a donor can report a real
+   count rather than an intention. It owns no eligibility opinion, exactly like
+   `LootItems`, and refuses to run outside an explorable area (A5).
+   `Items.LootGroundItems` builds the nearest-first candidate array -- unowned
+   items, plus items still reserved for this character, which is what Recall
+   needs -- and delegates to `LootItems` for locks, movement, and the free-slot
+   bail-out. Still to do: verify by hand on a single account with a throwaway
+   item.
 3. **Enum + handlers.** The three commands and their `Messaging.py` handlers,
    copying the `PickUpLoot` suspend/restore/finally shape. Verify with two
    accounts driven by hand-sent messages through the existing Messaging
