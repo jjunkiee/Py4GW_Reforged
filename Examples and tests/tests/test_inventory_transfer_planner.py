@@ -609,23 +609,59 @@ def test_shared_memory_adapter() -> None:
         FakeSharedBag(1, 4, [(IRON, 250), (0, 0), (DYE, 1)]),
         FakeSharedBag(2, 2, []),
     ]
-    # A model id parked past Size is outside the bag and must not be read.
+    # An item parked past the published Size. This fixture used to assert such an
+    # item was junk outside the bag and must not be read. A live client disproved
+    # that: Size carries the bag's item count, not its capacity, so honouring it
+    # silently drops real items out of the plan. See test_untrustworthy_bag_size.
     bags[1].Slots[5] = FakeSharedSlot(2, 5, IRON, 99)
 
     snapshot = IT.snapshot_from_shared_bags(bags)
-    check("capacity is the sum of bag sizes", snapshot.capacity == 6, "got %r" % snapshot.capacity)
-    check("empty slots are skipped", snapshot.used_slots == 2, "got %r" % snapshot.used_slots)
-    check("free slots follow capacity minus used", snapshot.free_slots == 4)
-    check("nothing is read past Size", all(item.quantity != 99 for item in snapshot.items()))
+    check("every occupied slot is read", snapshot.used_slots == 3, "got %r" % snapshot.used_slots)
+    check("an item past Size is still read", any(item.quantity == 99 for item in snapshot.items()))
+    check("empty slots are skipped", all(item.model_id != 0 for item in snapshot.items()))
+    check("capacity is floored at the highest occupied slot", snapshot.capacity == 10, "got %r" % snapshot.capacity)
+    check("free slots follow capacity minus used", snapshot.free_slots == 7)
 
     records = snapshot.items()
-    check("records keep bag and slot", [(r.bag_id, r.slot) for r in records] == [(1, 0), (1, 2)], repr(records))
+    check(
+        "records keep bag and slot",
+        [(r.bag_id, r.slot) for r in records] == [(1, 0), (1, 2), (2, 5)],
+        repr(records),
+    )
     check("a real stack proves stackability", records[0].stackable is True)
     check("a single item proves nothing", records[1].stackable is None)
     check("the snapshot carries no item ids", all(r.item_id == 0 for r in records))
     check("so nothing from a snapshot is droppable", IT.select_droppable(records, DEFAULT) == ())
-    check("but everything is plannable", len(IT.select_plannable(records, DEFAULT)) == 2)
-    check("quantity_of totals a model", snapshot.quantity_of(IRON) == 250)
+    check("but everything is plannable", len(IT.select_plannable(records, DEFAULT)) == 3)
+    check("quantity_of totals a model", snapshot.quantity_of(IRON) == 349)
+
+
+def test_untrustworthy_bag_size() -> None:
+    section("a Size that is really an item count cannot break the budget")
+
+    # Reproduces what a live client published on 2026-09-03: a character holding
+    # 19 items across 45 slots reported a total Size of 19. Bounding the read by
+    # Size lost five of those items and reported five free slots that did not
+    # exist, while the 26 slots that were actually free went unseen.
+    packed = FakeSharedBag(1, 3, [(IRON, 10), (DYE, 1), (SALVAGE_KIT, 1)])
+    sparse = FakeSharedBag(2, 1, [])
+    sparse.Slots[9] = FakeSharedSlot(2, 9, IRON, 5)
+
+    snapshot = IT.snapshot_from_shared_bags([packed, sparse])
+    check("no item is lost to a short Size", snapshot.used_slots == 4, "got %r" % snapshot.used_slots)
+    check("capacity can never sit below its contents", snapshot.capacity >= snapshot.used_slots)
+    check("free slots are never negative", snapshot.free_slots >= 0)
+
+    # The client that owns the bags knows the real number and overrides the guess.
+    corrected = snapshot.with_capacity(45)
+    check("an authoritative capacity replaces the guess", corrected.capacity == 45)
+    check("and the free count follows it", corrected.free_slots == 41)
+    check("the items survive the correction", corrected.used_slots == snapshot.used_slots)
+    check(
+        "item identity survives too",
+        [(r.bag_id, r.slot) for r in corrected.items()] == [(r.bag_id, r.slot) for r in snapshot.items()],
+    )
+    check("a capacity below the contents is refused", snapshot.with_capacity(1).capacity == 4)
 
 
 def test_policy_registry() -> None:
@@ -1031,6 +1067,7 @@ def main() -> int:
     test_stall_detection()
     test_reconcile_round()
     test_shared_memory_adapter()
+    test_untrustworthy_bag_size()
     test_policy_registry()
     test_policy_text_parsers()
     test_status_codes()
