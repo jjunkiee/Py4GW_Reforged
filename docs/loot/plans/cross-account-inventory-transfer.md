@@ -1,9 +1,11 @@
 # Cross-Account Inventory Transfer (Drop-and-Collect Ferry)
 
-**Status:** Phases 1-2 of section 8 (planner, offline tests, yield helpers) are
-implemented; phases 3-6 are still proposed. Nothing coordinates a transfer yet:
-the drop and collect primitives exist, but no command, handler, or widget calls
-them, so this feature still cannot move an item on its own.
+**Status:** Phases 1-3 of section 8 (planner, offline tests, yield helpers,
+enum, message handlers) are implemented; phases 4-6 are still proposed. The
+three commands now exist and can be driven by hand from the Messaging window's
+send-message section, but no widget composes them into a session, so a transfer
+is still a manual, one-round-at-a-time exercise with no precheck, no rally, no
+reconciliation, and no settle warning.
 Every game-behavior claim marked *inferred* below remains unverified against a
 live injected client and must be confirmed before the corresponding code is
 trusted. The planner encodes those assumptions as constants and defaults to the
@@ -14,6 +16,17 @@ conservative branch, so it is arithmetically proven and behaviorally unproven.
 passing). Pyright reports zero errors on both files at the project
 configuration and at `strict`. No live-client verification has been run, and
 none of A1-A7 is confirmed.
+
+**Phase 3 landed:** `TransferDropItems`, `TransferPickUpItems` and
+`TransferReport` appended to `SharedCommandType`, their handlers and dispatch
+cases in `Widgets/System/Messaging.py`, and the shared protocol vocabulary
+(named policies, round status codes) in the phase 1 planner. Pyright at the
+project configuration reports the same sixteen pre-existing errors on
+`Messaging.py` as the committed file and no new diagnostic; the planner is
+still clean at the project configuration and at `strict`; the offline fixture
+now runs 113 checks, all passing. No live-client verification has been run, so
+A1-A7 all remain unconfirmed and no message in this protocol has ever been
+sent between two real clients.
 
 **Phase 2 landed:** `Items.DropItems` and `Items.LootGroundItems` in
 `Py4GWCoreLib/routines_src/yield_src/items.py`. Pyright at the project
@@ -153,8 +166,15 @@ Hard limits that shape the protocol:
   pending reuses the existing slot instead of queuing a second copy
   (`AllAccounts.py:953-985`). A round counter in `Params[0]` is therefore
   mandatory, or round 2 silently collapses into round 1.
-- `_can_communicate` gates on isolation groups; participants must share one
-  (`AllAccounts.py:949`).
+- `_can_communicate` gates on isolation groups, but party membership is an
+  explicit escape hatch: two accounts sharing a non-zero `PartyID` may always
+  exchange coordination messages, whatever their isolation groups say
+  (`AllAccounts.py:303-322`, verified in source). An account may also always
+  message itself, which is what lets a coordinator that is also the receiver
+  route its own round result through the same report path. Since this feature
+  requires one party anyway, isolation groups are effectively a non-issue for
+  it; the precheck in section 6.2 keeps the test only to fail early and
+  legibly.
 
 ### 3.5 Coordination, safety, and movement primitives
 
@@ -256,8 +276,8 @@ PRECHECK -> SUSPEND -> RALLY -> [ ROUND: PLAN -> DROP -> COLLECT -> RECONCILE ]*
    one `PartyID` - the `on_same_map_and_party` predicate at
    `commands.py:304`. Explorable instances are party-scoped, so this is the
    real "same instance" test.
-3. Every participant shares an isolation group, or `SendMessage` will refuse
-   (`AllAccounts.py:949`).
+3. Every participant shares an isolation group, or is in the same party,
+   which `_can_communicate` accepts as equivalent (section 3.4).
 4. Nobody is `InAggro` (`AccountStruct.InAggro`) and nobody is dead.
 5. Receiver free slots > 0.
 6. No other transfer session is running - a module-level busy flag, following
@@ -269,6 +289,22 @@ between rounds a donor's `Looting` comes back on and it re-collects its own
 drop. Optionally also `PauseWidgets` on donors to keep
 `AutoInventoryHandler` (`Py4GWCoreLib/py4gwcorelib_src/AutoInventoryHandler.py`)
 and LootEx from salvaging or depositing items mid-flight.
+
+**Unresolved, and phase 5 has to answer it.** A session-scoped suspension is
+not actually safe today. `HealStaleHeroAISnapshot` runs every frame from
+`Messaging.main()` and restores any outstanding snapshot as soon as the account
+has no *active* HeroAI-suspending message and all five options read disabled
+(`Messaging.py:822-848`). `DisableHeroAI` finishes its message immediately, so
+a suspension held across rounds is exactly the state that heal treats as stale
+and unwinds. Phase 3 registered `TransferDropItems` and `TransferPickUpItems`
+in `_HERO_AI_SUSPENDING_COMMANDS`, which protects the window while a round is
+in flight and makes each handler self-sufficient - it snapshots and restores
+around its own step, and that nests correctly inside a session suspension
+because the snapshot stack is strict. It does **not** protect the gap between
+rounds. Phase 5 either re-sends `DisableHeroAI` at the head of each round,
+keeps a suspending message active for the session's duration, or teaches heal
+about an owned session. Do not assume the current suspend survives a round
+boundary.
 
 `RALLY`: coordinator sends `PixelStack` with the receiver's coordinates so
 donors cluster, then each donor drops at the rally point. A tight pile means
@@ -364,15 +400,40 @@ them.
 |---|---|---|---|
 | `TransferDropItems` | coordinator -> donor | `(round_id, max_items, rally_x, rally_y)` | `(policy_name, session_id, "", "")` |
 | `TransferPickUpItems` | coordinator -> receiver | `(round_id, max_items, radius, 0)` | `(session_id, "", "", "")` |
-| `TransferReport` | donor -> coordinator | `(round_id, items_dropped, slots_used, status_code)` | `(session_id, donor_email, "", "")` |
+| `TransferReport` | participant -> coordinator | `(round_id, items_moved, slots_used, status_code)` | `(session_id, reporter_email, "", "")` |
 
 `round_id` in `Params[0]` defeats the `SendMessage` dedup described in
 section 3.4. `session_id` in `ExtraData` keeps two overlapping sessions from
 reconciling each other's reports; it is a short token, well inside the
 63-character field.
 
-Message cost per round: `N` drops + 1 pickup + `N` reports = `2N + 1`. With 8
-accounts that is 17 of the 64 global inbox slots, and only while a round is
+Two refinements the implementation made to this table, both additive:
+
+- **The receiver reports too.** The plan originally had only donors reporting.
+  But the receiver's report is the one edge that says a round is *over*;
+  without it the coordinator has to infer completion from a shared-memory
+  snapshot that is up to 1.5 s stale. It reuses `TransferReport` rather than
+  adding a command, so `Params[1]` is "items this participant moved" - dropped
+  by a donor, collected by the receiver. Message cost per round becomes
+  `2N + 2`, still `O(participants)`.
+- **`status_code` is a named vocabulary**, not an ad-hoc integer.
+  `Py4GWCoreLib/py4gwcorelib_src/inventory_transfer.py` owns it, because both
+  the coordinator and the participant must read the same one and that module is
+  the only one both sides already import: `STATUS_OK`, `STATUS_BUSY`,
+  `STATUS_NOT_EXPLORABLE`, `STATUS_NOTHING_ELIGIBLE`, `STATUS_RALLY_FAILED`,
+  `STATUS_ERROR`, `STATUS_NO_BUDGET`, `STATUS_INVENTORY_FULL`, with
+  `status_name()` for the UI. They are small integers so the `c_float` round
+  trip is exact, and `STATUS_OK` is `0` so a plain truth test cannot invert it.
+
+`policy_name` resolves through `inventory_transfer.resolve_policy()`, which
+falls back to the conservative `default` policy for an unknown or empty name.
+That fallback direction matters: a donor on an older build than the coordinator
+drops *fewer* items than budgeted, never more. Built-in names are `default`,
+`stackables` and `optimistic`; a widget passes user-defined policies through the
+`extra` argument rather than mutating a global.
+
+Message cost per round: `N` drops + 1 pickup + `N + 1` reports = `2N + 2`. With
+8 accounts that is 18 of the 64 global inbox slots, and only while a round is
 in flight.
 
 Handler shape follows the existing convention exactly - a generator appended
@@ -380,7 +441,16 @@ to `GLOBAL_CACHE.Coroutines` by `ProcessMessages()`, `MarkMessageAsRunning`
 at entry, and `MarkMessageAsFinished` in a `finally` so a raised exception can
 never wedge the slot. `PickUpLoot` (`Messaging.py:2118-2262`) is the model to
 copy, including its comment explaining why the whole body lives inside the
-`try`.
+`try`. `TransferReport` is the one exception: it has nothing to wait for, so it
+is a plain function called straight from `ProcessMessages()`, following
+`AccountSettingsSyncResult`.
+
+Each participant's report is sent from that same `finally`, so a handler that
+dies mid-round still answers and the coordinator never waits out a round that
+is already over. A module-level `_transfer_busy` flag serialises transfer steps
+on one client - `ProcessMessages()` dispatches a fresh coroutine every frame,
+and two overlapping sessions would otherwise have two coroutines walking and
+dropping at once. A refused step reports `STATUS_BUSY` rather than queueing.
 
 ### 6.6 Eligibility filter (never drop these)
 
@@ -457,10 +527,20 @@ Each phase is independently reviewable and leaves the tree buildable.
    needs -- and delegates to `LootItems` for locks, movement, and the free-slot
    bail-out. Still to do: verify by hand on a single account with a throwaway
    item.
-3. **Enum + handlers.** The three commands and their `Messaging.py` handlers,
-   copying the `PickUpLoot` suspend/restore/finally shape. Verify with two
-   accounts driven by hand-sent messages through the existing Messaging
-   window's send-message section (`Messaging.py:393`).
+3. **Enum + handlers.** *Implemented, live verification outstanding.* The
+   three commands are appended to `SharedCommandType`; the handlers live in
+   `Widgets/System/Messaging.py` in the `PickUpLoot` suspend/restore/finally
+   shape, each reporting from its `finally` so a dead round still answers.
+   The donor resolves item ids from a live bag read
+   (`_read_local_transfer_items`, which fills every tri-state flag because only
+   a live read can) and drops through `Items.DropItems`; the receiver counts
+   the pile before and after and collects through `Items.LootGroundItems`. The
+   coordinator side files reports into a `GLOBAL_CACHE`-parked cache, readable
+   with `get_transfer_reports` / `clear_transfer_reports`, which is the seam
+   phase 4 plugs into. The new commands appear automatically in the Messaging
+   window's send-message section (`_MESSAGE_TYPE_OPTIONS` enumerates
+   `SharedCommandType`), so the two-account hand-driven check needs no UI work.
+   Still to do: run that check, in an explorable area, with a throwaway item.
 4. **Widget, dry-run only.** Account selection, preview of the computed plan,
    no packets sent. This is the review gate: the plan must read correctly
    before it is allowed to move anything.
@@ -482,7 +562,36 @@ at exactly one free slot with a 250 stack pending; protected model excluded;
 last-kit protection; multi-round decomposition; stall detection.
 
 **Static:** the project's strict Pyright/Pylance check over every changed
-file. Typing failures are defects, per `AGENTS.md`.
+file. Typing failures are defects, per `AGENTS.md`. `Messaging.py` carries
+sixteen pre-existing errors at the project configuration; the bar for a change
+to it is that the count and the list are unchanged, checked against
+`git show HEAD:Widgets/System/Messaging.py`, not that the file is clean.
+
+**Hand-driven protocol check (phase 3, two accounts, no widget):** send the
+messages from the Messaging window's send-message section. The commands appear
+in its dropdown on their own.
+
+1. Both accounts in the same explorable area and the same party. Donor holds
+   one throwaway tradable item; receiver has free slots.
+2. Coordinator -> donor, `TransferDropItems`, params
+   `(1, 1, 0, 0)`, extra `("default", "smoke", "", "")`. Rally coordinates of
+   `0, 0` mean "drop where you stand", which keeps the first check to one
+   moving part.
+3. Expect one item on the ground and one `TransferReport` back with
+   `items_moved = 1`, `status = 0`. The coordinator's console logs the report;
+   `get_transfer_reports("smoke")` is what a widget would read.
+4. Coordinator -> receiver, `TransferPickUpItems`, params `(1, 0, 1012, 0)` (1012 is `Range.Earshot`, and `0` means Earshot too),
+   extra `("smoke", "", "", "")`. Expect the item collected and a second
+   report from the receiver.
+5. Repeat step 2 with `round_id = 2` to prove the dedup escape works: an
+   identical round 1 message would silently reuse the pending slot instead of
+   queueing a second drop.
+6. Repeat step 2 in an outpost. Expect `status = 2` (not explorable) and
+   nothing dropped - that is the A5 gate, reported rather than attempted.
+
+Confirms the protocol, the report path, the busy flag and the dedup escape. It
+confirms none of A1-A7 beyond A5's failure mode; those need the live runs
+below.
 
 **Live, in this order, each confirming the assumptions it depends on:**
 

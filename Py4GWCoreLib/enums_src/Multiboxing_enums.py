@@ -91,6 +91,12 @@ class SharedCommandType(IntEnum):
     AccountSettingsSyncResult = auto()
     #endregion
 
+    # Cross-account inventory transfer (drop-and-collect ferry).
+    # IMPORTANT: append only; persisted/shared enum values must never shift.
+    TransferDropItems = auto()
+    TransferPickUpItems = auto()
+    TransferReport = auto()
+
 class ReloadType(IntEnum):
     Unknown = auto()
     Buying = auto()

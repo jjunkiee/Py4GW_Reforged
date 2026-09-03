@@ -13,4 +13,6 @@ owning Python source, native bindings, and injected-client observations.
   running a trade window per pair; records the reuse map, the shared-memory
   message limits that shape its protocol, the slot/stack budgeting algorithm,
   and the game-behavior assumptions still awaiting live verification. Its
-  offline planner (phase 1) is implemented; nothing can move an item yet.
+  offline planner, drop/collect yield helpers and shared-memory command
+  handlers (phases 1-3) are implemented and hand-drivable from the Messaging
+  window; no widget composes them into a session yet.
