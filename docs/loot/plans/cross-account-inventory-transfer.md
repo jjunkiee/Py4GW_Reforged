@@ -284,9 +284,133 @@ These carry the design. None is verified in this repository.
 | A6 | `is_tradable == False` is a sound proxy for "cannot be dropped" (quest items and similar) | protection filter | Test with a known quest item and a customized weapon |
 | A7 | Dyes share `ModelID.Vial_Of_Dye = 146` but do not stack across colors | merge prediction | Two different dye colors in one inventory |
 
-A4 and A7 are the two that can silently produce a wrong slot budget. Until
-they are confirmed, the planner defaults to the conservative branch
-(section 6.3).
+A4 and A7 are the two that can silently produce a wrong slot budget. Both are
+now confirmed (below), but the planner still defaults to the conservative
+branch (section 6.3) because `optimistic` remains opt-in.
+
+**Live results, 2026-09-03**, from the hand-driven runs in section 9. Two
+accounts in one party in an explorable area, messages sent by hand from the
+Messaging window.
+
+| # | Result | Observed |
+|---|---|---|
+| A1 | **Disproved for our call path** | The *game* drops a whole stack as one ground item: a stack of 10 dragged out by hand produced one pile, and one `TransferPickUpItems` collected all 10. Our call path does not reach that behavior -- `Inventory.DropItem(item_id, quantity)` dropped a single item with `quantity = 10`, logging `Item 4 dropped partially, 9 still in the bags`. Unresolved; see below. |
+| A2 | **Confirmed** | Every donor drop was collectable by the receiver, and C3.3 confirmed a donor can retake its own drop, which is what Recall needs. |
+| A3 | **Confirmed, and stronger than assumed** | Player drops do not despawn at all. Only mob drops reserved for a player become unassigned after ten minutes. Asserted by the maintainer from game knowledge rather than measured by waiting; the ten-minute run was skipped as unnecessary. |
+| A4 | **Confirmed** | A donor stack merged into the receiver's partial stack of the same model on pickup, and a 245 + 10 case spilled correctly to 250 + 5 across two slots. |
+| A5 | **Confirmed** | A drop attempted in an outpost dropped nothing and reported `STATUS_NOT_EXPLORABLE`. The refusal is reported, not attempted. |
+| A6 | **Disproved for quest items** | The customized weapon, the last ID kit and the last salvage kit were all correctly held back. The quest item was **dropped**: quest items report `is_tradable == True` and drop without complaint, so the tradability proxy never sees them. Fixed by a separate rule; see below. |
+| A7 | **Confirmed** | Dyes stack with the same color and refuse to merge across colors, exactly as the planner's non-merge branch assumes. |
+
+Three defects the live runs exposed, all fixed except A1:
+
+- **`item.slot` coerced through `or -1`** in both the donor's live read
+  (`Messaging.py`) and the shared-memory publisher (`AccountStruct.py`). Slot 0
+  is a real slot and zero is falsy, so the first item of every bag was
+  discarded on both sides. They were wrong identically, so the widget preview
+  agreed with the drop and nothing looked inconsistent. Fixed.
+- **`Items.LootItems` waited for an item to leave the ground in an unbounded
+  loop.** A pickup into a full inventory never terminated, so the calling
+  coroutine never returned, its `finally` never ran, and the receiver was left
+  with HeroAI suspended and `_transfer_busy` stuck. Observed directly in C3.2.
+  The wait is now bounded by `pickup_timeout`, and `LootGroundItems` uses
+  `LootItemsWithMaxAttempts` so a round can report what it failed to collect.
+  The first fix traded a hang for a retry storm: the bounded version tries every
+  remaining item `max_attempts` times before returning, so a full receiver spent
+  minutes failing item by item with HeroAI still suspended. `LootGroundItems`
+  now passes `stop_on_failure=True`, which is new and defaults off so the six
+  farming callers keep skipping and continuing. For a pile at a single point the
+  first refusal is decisive: the cause is a full inventory, not a bad item.
+- **`GetFreeSlotCount()` deltas are not trustworthy.** A round that dropped one
+  item reported `freeing 32 slot(s)`. The drop report now counts slots freed
+  from the items that left the bags (drops are whole stacks, so it is exactly
+  one each), and the pickup report clamps its delta to the number of items it
+  actually collected.
+
+**A1 is a native defect, and the packet capture shows how to route around it.** The game can
+drop a whole stack -- dragging one out by hand produces a single ground pile
+that one `TransferPickUpItems` collects whole. No Python binding can reach that
+behavior. Verified live 2026-09-03 with `Examples and tests/drop_stack_diagnostic.py`,
+which drops the same stack through each candidate in turn:
+
+- `GLOBAL_CACHE.Inventory.DropItem` -> action queue ->
+  `PyInventory.Inventory.DropItem(item_id, quantity)`: drops one item.
+- `PyItem.drop_item_by_id(item_id, quantity)`, called directly with no queue in
+  the way: drops one item.
+
+Both Python entry points converge on one native function, which is why they
+behaved identically -- they were never two experiments. Reading
+`Py4GW_Reforged_Native` (2026-09-04) shows the C++ is a clean pass-through:
+`PyInventory::DropItem` and `drop_item_by_id` hand the quantity to
+`GW::item::DropItem`, which calls `g_drop_item_func(item->item_id, quantity)`
+with no clamping -- unlike `MoveItem` beside it, which clamps to the live stack
+size. The pattern (`Ä@j j` at `-0x4E`) is marked
+parity in that repo's `pattern_parity_audit.md`.
+
+**The CToS capture settles what reading could not.** Both a manual drag and the
+binding emit the same packet, so the game's own drop path is reachable and the
+quantity word in it is honored:
+
+| Drop | header | word 1 | word 2 |
+|---|---|---|---|
+| Manual drag of a stack of 22 | 44 `DROP_ITEM`, size 12 | item id | **22** |
+| `Inventory.DropItem(item, 21)` | 44 `DROP_ITEM`, size 12 | item id | **1** |
+
+The game honors the quantity; `g_drop_item_func` never carries it. Whatever the
+pattern resolves to, it is not the two-argument function the typedef declares,
+so the second argument is dropped before the packet is built. That is a defect
+in `Py4GW_Reforged_Native` affecting every consumer of `GW::item::DropItem`, and
+it should be fixed there.
+
+**The obvious workaround does not currently work either.** `PyCtoS.SendPacket`
+takes the packet as dwords, so `[44, item_id, quantity]` should reproduce the
+drag exactly. Sent live 2026-09-04 with a stack of 22: the call returned `True`
+and nothing was dropped. `True` is not a send -- `PyCtoS.SendPacket` is
+`GW::CToS::QueuePacket`, which validates only the word count and then enqueues.
+The real send runs later on the game thread, behind four gates that return
+`false` silently into a lambda that discards the result:
+
+- `IsSendable()` -- map loaded, not observing, not in a loading screen.
+- `ReadConnection` -- dereferences the resolved game server object.
+- `IsConnectionReady` -- hardcoded `connection + 0x60 == 2` and `+ 0x38 != 0`.
+- `IsValidSendHeader` -- walks `connection + 0x8` to a channel, then a message
+  count at `+ 0x24` and a format table at `+ 0x1C`.
+
+`Py4GW_injection_log.txt` confirms `[ctos] CToS sender initialized.`, so the
+send target and game server object both resolved and the module is live. That
+leaves the three state checks, whose struct offsets are hardcoded rather than
+pattern-resolved. Nothing else in `Py4GW_Reforged` imports `PyCtoS` -- this
+diagnostic is its only consumer -- so the sender has never been exercised and a
+stale offset here would have gone unnoticed.
+
+Next step is to localise it, which the packet sniffer can do without a rebuild:
+send the CToS packet and look for a header 44 line. A captured line means the
+packet reached the game's send routine and the server ignored it; no line means
+CToS rejected it first, and the fix is native either way.
+
+Two native defects are now on the table for `Py4GW_Reforged_Native`, both found
+by this feature and neither owned by it:
+
+1. `g_drop_item_func` does not carry its quantity argument, so
+   `GW::item::DropItem` is broken for every consumer.
+2. `GW::CToS::SendPacket` discards its own failure result inside
+   `QueuePacket`'s lambda, so a rejected packet is indistinguishable from a
+   sent one at the Python boundary. Whatever the root cause, that is worth
+   fixing on its own: it is the reason this took a packet capture to notice.
+
+What this leaves working, and what it does not:
+
+- **Non-stackable items ferry correctly.** Weapons, trophies, armor, kits, dyes:
+  one item, one slot, one drop. Every live run above that moved a
+  non-stackable behaved as designed.
+- **Stacks do not move.** A round that selects a stack drops one unit of it and
+  leaves the rest. `Items.DropItems` no longer counts that as a successful drop
+  -- a partial drop means the caller budgeted a whole stack and the stack is
+  still in the bags -- so a stack-only round reports zero items moved and
+  `STATUS_ERROR` rather than claiming a delivery it did not make. The one unit
+  already on the ground is recoverable with Recall.
+- The quantity is still passed on every drop, so this path becomes correct with
+  no change here the moment the native binding honors it.
 
 Caution carried over from a known native defect: do **not** identify items by
 decoding UI frame text. The decoded-text-label path has crashed the client

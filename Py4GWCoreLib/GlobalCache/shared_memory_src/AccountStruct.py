@@ -228,7 +228,10 @@ class AccountStruct(Structure):
                 try:
                     bag_struct.Size = int(bag.GetSize() or 0)
                     for item in bag.GetItems():
-                        slot_value = int(getattr(item, "slot", -1) or -1)
+                        # Not `or -1`: slot 0 is a real slot, so the falsy-zero idiom
+                        # published every bag with its first item missing.
+                        raw_slot = getattr(item, "slot", None)
+                        slot_value = -1 if raw_slot is None else int(raw_slot)
                         if slot_value < 0 or slot_value >= len(bag_struct.Slots):
                             continue
                         slot_struct = bag_struct.Slots[slot_value]

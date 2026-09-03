@@ -477,8 +477,14 @@ class Items:
                 return False
             if Agent.IsValid(item_id):
                 yield from YieldPlayer.InteractAgent(item_id)
-                while True:
+                # Bounded on purpose. An interact that never lands -- a full inventory
+                # is the ordinary case -- used to spin here forever, so this generator
+                # never returned, the caller's finally never ran, and anything it had
+                # suspended (HeroAI, a busy flag) stayed suspended until a reload.
+                waited_ms = 0
+                while waited_ms < pickup_timeout:
                     yield from wait(50)
+                    waited_ms += 50
                     live_items = AgentArray.GetItemArray()
                     if item_id not in live_items:
                         break
@@ -499,7 +505,16 @@ class Items:
         pickup_timeout: int = 5000,
         max_attempts: int = 5,
         attempts_timeout_seconds: int = 3,
+        stop_on_failure: bool = False,
     ):
+        """Collect the given item agents, retrying each one before giving up on it.
+
+        Returns the ids it could not take. `stop_on_failure` ends the whole run at the
+        first item that will not come: for a pile at one point that is the right call,
+        because the cause is a full inventory rather than a bad item and every further
+        attempt costs `max_attempts * attempts_timeout_seconds` for a foregone result.
+        A farming route wants the default, which skips the item and carries on.
+        """
         from ...AgentArray import AgentArray
         from ..Checks import Checks
 
@@ -572,6 +587,12 @@ class Items:
                 if not picked_up:
                     ConsoleLog("Loot", f"Failed to pick up item {item_id} after {max_attempts} attempts.")
                     failed_items.append(item_id)
+                    if stop_on_failure:
+                        if claimed_item_id:
+                            clear_loot_lock(claimed_item_id)
+                        ActionQueueManager().ResetAllQueues()
+                        Items._finish_active_pick_up_loot_message()
+                        return failed_items + item_array
             if claimed_item_id:
                 clear_loot_lock(claimed_item_id)
 
@@ -620,16 +641,23 @@ class Items:
         poll_ms: int = 50,
         explorable_only: bool = True,
     ) -> Generator[Any, Any, list[int]]:
-        """Drop the given inventory items where the character stands, whole stacks only.
+        """Drop the given inventory items where the character stands.
 
         This is the movement primitive; the caller owns selection and eligibility, the
         same way LootItems owns no opinion about what it picks up. Each item is dropped
-        with its live quantity so a stack is never split, and each drop is confirmed by
-        polling before the next one is queued.
+        with its live quantity, and each drop is confirmed by polling before the next
+        one is queued.
 
-        Returns the ids observed leaving the bags. Ids missing from that list are still
-        in the inventory. A failed drop does not stop the run: the remaining items may
-        still be droppable.
+        Whole stacks do not currently work, and the caller must not assume they do.
+        Verified live 2026-09-03: both `PyInventory.Inventory.DropItem` and
+        `PyItem.drop_item_by_id` ignore the quantity argument and drop a single item
+        from a stack. The quantity is still passed, so this becomes correct the moment
+        the native binding honors it -- the defect is in the native project, not here.
+
+        Returns the ids observed leaving the bags entirely. An item that only shrank is
+        not in that list: the caller budgeted a whole stack and the stack is still in
+        the bags, so reporting it as moved would be a lie. A failed drop does not stop
+        the run: the remaining items may still be droppable.
         """
         from ..Checks import Checks
 
@@ -669,14 +697,18 @@ class Items:
                     f"Item {item_id} did not leave the bags within {drop_timeout} ms.",
                     Console.MessageType.Warning,
                 )
+            elif item_still_present(item_id):
+                # A partial drop is a failed move, not a successful one. Until the native
+                # binding honors the quantity this is the normal outcome for any stack,
+                # so counting it as dropped would report every stack as ferried while it
+                # sat in the donor bags.
+                ConsoleLog(
+                    "DropItems",
+                    f"Item {item_id} dropped partially, {item_quantity(item_id)} still in the bags.",
+                    Console.MessageType.Warning,
+                )
             else:
                 dropped.append(item_id)
-                if item_still_present(item_id):
-                    ConsoleLog(
-                        "DropItems",
-                        f"Item {item_id} dropped partially, {item_quantity(item_id)} still in the bags.",
-                        Console.MessageType.Warning,
-                    )
 
             if progress_callback:
                 progress_callback((index + 1) / total_items)
@@ -694,6 +726,8 @@ class Items:
         log: bool = False,
         progress_callback: Optional[Callable[[float], None]] = None,
         pickup_timeout: int = 5000,
+        max_attempts: int = 2,
+        attempts_timeout_seconds: int = 3,
     ) -> Generator[Any, Any, bool]:
         """Collect free ground items around a point, nearest first.
 
@@ -727,13 +761,23 @@ class Items:
                 Console.MessageType.Info,
             )
 
-        result = yield from Items.LootItems(
+        # LootItemsWithMaxAttempts rather than LootItems: it gives up on an item it
+        # cannot take and returns the ones it failed, which is what a transfer round
+        # has to report. LootItems answers True either way.
+        # Everything here is one pile the character is already standing on, so the
+        # first refusal ends the run: the receiver is full, and the next seven items
+        # would each burn the same retry budget to learn the same thing. That wait is
+        # time the caller spends holding HeroAI suspended.
+        failed = yield from Items.LootItemsWithMaxAttempts(
             item_array,
             log=log,
             progress_callback=progress_callback,
             pickup_timeout=pickup_timeout,
+            max_attempts=max_attempts,
+            attempts_timeout_seconds=attempts_timeout_seconds,
+            stop_on_failure=True,
         )
-        return bool(result)
+        return not failed
 
     @staticmethod
     def WithdrawItems(model_id:int, quantity:int) -> Generator[Any, Any, bool]:

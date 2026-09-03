@@ -57,6 +57,12 @@ NON_MERGING_MODELS: frozenset[int] = frozenset({146})
 #: `Inventory.GetInventorySpace`, which also spans bags 1-4 only.
 INVENTORY_BAG_IDS: tuple[int, ...] = (1, 2, 3, 4)
 
+#: `ItemType.Quest_Item` from `Py4GWCoreLib/enums_src/Item_enums.py`, mirrored as
+#: a literal because this module imports nothing from Py4GWCoreLib. Quest items
+#: report as tradable and drop without complaint (verified live 2026-09-03), so
+#: the tradability filter never sees them and they need a rule of their own.
+QUEST_ITEM_TYPE = 21
+
 #: Snapshot-only fallback for spotting kits by model id, mirroring the same
 #: fallback `Inventory.GetFirstIDKit` already uses. The donor should set
 #: `is_id_kit` / `is_salvage_kit` from the native usage flags instead; these
@@ -89,6 +95,7 @@ REASON_NONE = ""
 REASON_EMPTY_SLOT = "empty slot"
 REASON_NOT_TRADABLE = "not tradable"
 REASON_CUSTOMIZED = "customized"
+REASON_QUEST_ITEM = "quest item"
 REASON_PROTECTED_MODEL = "protected model"
 REASON_MODEL_FLOOR = "would drop below the model quantity floor"
 REASON_LAST_ID_KIT = "last identification kit"
@@ -365,6 +372,11 @@ class TransferPolicy:
     #: Customized gear is useless to the receiver, so it is skipped by default.
     allow_customized: bool = False
 
+    #: Quest items are droppable and tradable, so nothing else here stops them
+    #: leaving. Ferrying one to the wrong character can strand a quest, which is
+    #: not a loss the receiver can undo by handing it back.
+    protect_quest_items: bool = True
+
     #: Models never dropped, whatever else says.
     protected_models: tuple[int, ...] = ()
 
@@ -537,6 +549,9 @@ def evaluate_item(item: ItemRecord, policy: TransferPolicy, context: DonorContex
     if item.customized is True and not policy.allow_customized:
         return EligibilityResult(VERDICT_BLOCKED, REASON_CUSTOMIZED)
 
+    if policy.protect_quest_items and item.item_type == QUEST_ITEM_TYPE:
+        return EligibilityResult(VERDICT_BLOCKED, REASON_QUEST_ITEM)
+
     if policy.stackables_only and item.stackable is False:
         return EligibilityResult(VERDICT_BLOCKED, REASON_NOT_STACKABLE)
 
@@ -560,7 +575,7 @@ def evaluate_item(item: ItemRecord, policy: TransferPolicy, context: DonorContex
         return EligibilityResult(VERDICT_UNVERIFIED, REASON_UNKNOWN_CUSTOMIZED)
     if policy.stackables_only and item.stackable is None:
         return EligibilityResult(VERDICT_UNVERIFIED, REASON_UNKNOWN_STACKABLE)
-    if policy.item_type_whitelist and item.item_type is None:
+    if item.item_type is None and (policy.item_type_whitelist or policy.protect_quest_items):
         return EligibilityResult(VERDICT_UNVERIFIED, REASON_UNKNOWN_ITEM_TYPE)
 
     return EligibilityResult(VERDICT_ALLOWED)
