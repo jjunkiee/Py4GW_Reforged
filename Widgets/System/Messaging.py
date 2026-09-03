@@ -3651,12 +3651,15 @@ def _read_local_transfer_items() -> list[InventoryTransfer.ItemRecord]:
         try:
             items = bag.GetItems()
         except Exception as exc:
-            ConsoleLog(MODULE_NAME, f"[Transfer] Could not read bag {bag_id}: {exc}", Console.MessageType.Warning, False)
+            ConsoleLog(MODULE_NAME, f"[Transfer] Could not read bag {bag_id}: {exc}", Console.MessageType.Warning, log=True)
             continue
 
         for item in items:
             item_id = int(getattr(item, "item_id", 0) or 0)
-            slot = int(getattr(item, "slot", -1) or -1)
+            # Not `or -1`: slot 0 is the first slot of a real bag, so the falsy-zero
+            # idiom silently dropped the first item of every bag from the donor list.
+            raw_slot = getattr(item, "slot", None)
+            slot = -1 if raw_slot is None else int(raw_slot)
             if item_id == 0 or slot < 0:
                 continue
 
@@ -3742,7 +3745,7 @@ def TransferDropItems(index: int, message: SharedMessageStruct):
                 MODULE_NAME,
                 f"[Transfer] Round {round_id}: another transfer step is running, refusing the drop.",
                 Console.MessageType.Warning,
-                False,
+                log=True,
             )
             return
 
@@ -3757,7 +3760,7 @@ def TransferDropItems(index: int, message: SharedMessageStruct):
                 MODULE_NAME,
                 f"[Transfer] Round {round_id}: not in an explorable area, dropping nothing.",
                 Console.MessageType.Warning,
-                False,
+                log=True,
             )
             return
 
@@ -3767,7 +3770,7 @@ def TransferDropItems(index: int, message: SharedMessageStruct):
                 MODULE_NAME,
                 f"[Transfer] Round {round_id}: no drop budget was granted.",
                 Console.MessageType.Warning,
-                False,
+                log=True,
             )
             return
 
@@ -3790,7 +3793,7 @@ def TransferDropItems(index: int, message: SharedMessageStruct):
                         MODULE_NAME,
                         f"[Transfer] Round {round_id}: could not reach the rally point, dropping nothing.",
                         Console.MessageType.Warning,
-                        False,
+                        log=True,
                     )
                     return
 
@@ -3802,14 +3805,16 @@ def TransferDropItems(index: int, message: SharedMessageStruct):
                 MODULE_NAME,
                 f"[Transfer] Round {round_id}: nothing eligible under policy {policy.name}.",
                 Console.MessageType.Info,
-                False,
+                log=True,
             )
             return
 
-        free_before = int(GLOBAL_CACHE.Inventory.GetFreeSlotCount())
         dropped = yield from Routines.Yield.Items.DropItems([record.item_id for record in droppable])
         items_dropped = len(dropped)
-        slots_freed = max(int(GLOBAL_CACHE.Inventory.GetFreeSlotCount()) - free_before, 0)
+        # Counted, not measured. Drops are whole stacks, so each item that left the
+        # bags freed exactly one slot. A GetFreeSlotCount delta claimed 32 freed slots
+        # for a single dropped item during the live run on 2026-09-03.
+        slots_freed = items_dropped
 
         if items_dropped == 0:
             # Eligible items that all refused to leave the bags is a real failure, not an
@@ -3820,11 +3825,11 @@ def TransferDropItems(index: int, message: SharedMessageStruct):
             MODULE_NAME,
             f"[Transfer] Round {round_id}: dropped {items_dropped} of {len(droppable)} planned item(s), freeing {slots_freed} slot(s).",
             Console.MessageType.Info,
-            False,
+            log=True,
         )
     except Exception as exc:
         status = InventoryTransfer.STATUS_ERROR
-        ConsoleLog(MODULE_NAME, f"[Transfer] Drop round {round_id} failed: {exc}", Console.MessageType.Error, False)
+        ConsoleLog(MODULE_NAME, f"[Transfer] Drop round {round_id} failed: {exc}", Console.MessageType.Error, log=True)
     finally:
         if suspended:
             RestoreHeroAISnapshot(donor_email)
@@ -3868,7 +3873,7 @@ def TransferPickUpItems(index: int, message: SharedMessageStruct):
                 MODULE_NAME,
                 f"[Transfer] Round {round_id}: another transfer step is running, refusing the pickup.",
                 Console.MessageType.Warning,
-                False,
+                log=True,
             )
             return
 
@@ -3881,7 +3886,7 @@ def TransferPickUpItems(index: int, message: SharedMessageStruct):
                 MODULE_NAME,
                 f"[Transfer] Round {round_id}: not in an explorable area, collecting nothing.",
                 Console.MessageType.Warning,
-                False,
+                log=True,
             )
             return
 
@@ -3904,7 +3909,7 @@ def TransferPickUpItems(index: int, message: SharedMessageStruct):
                 MODULE_NAME,
                 f"[Transfer] Round {round_id}: no free ground items within {int(radius)} of the rally point.",
                 Console.MessageType.Info,
-                False,
+                log=True,
             )
             return
 
@@ -3914,10 +3919,13 @@ def TransferPickUpItems(index: int, message: SharedMessageStruct):
             max_items=max(max_items, 0),
             center=rally_point,
         )
-        slots_used = max(free_before - int(GLOBAL_CACHE.Inventory.GetFreeSlotCount()), 0)
         # Everything that left the ground. A party member looting the same pile would
         # inflate this; HeroAI is suspended on every participant precisely so it does not.
         items_collected = len(before - _transfer_ground_item_ids(rally_point, radius))
+        # Clamped to what those items could possibly have cost: a merged stack takes no
+        # new slot, a fresh one takes exactly one. The raw free-slot delta is not
+        # trustworthy on its own -- see the drop side.
+        slots_used = min(max(free_before - int(GLOBAL_CACHE.Inventory.GetFreeSlotCount()), 0), items_collected)
 
         if not collected_all:
             if int(GLOBAL_CACHE.Inventory.GetFreeSlotCount()) <= 0:
@@ -3929,11 +3937,11 @@ def TransferPickUpItems(index: int, message: SharedMessageStruct):
             MODULE_NAME,
             f"[Transfer] Round {round_id}: collected {items_collected} of {len(before)} ground item(s), filling {slots_used} slot(s).",
             Console.MessageType.Info,
-            False,
+            log=True,
         )
     except Exception as exc:
         status = InventoryTransfer.STATUS_ERROR
-        ConsoleLog(MODULE_NAME, f"[Transfer] Pickup round {round_id} failed: {exc}", Console.MessageType.Error, False)
+        ConsoleLog(MODULE_NAME, f"[Transfer] Pickup round {round_id} failed: {exc}", Console.MessageType.Error, log=True)
     finally:
         if suspended:
             RestoreHeroAISnapshot(receiver_email)
@@ -3979,10 +3987,10 @@ def TransferReport(index: int, message: SharedMessageStruct) -> None:
             MODULE_NAME,
             f"[Transfer] Round {round_id} report from {reporter_email}: {items_moved} item(s), {slots_used} slot(s), {entry.status_text}.",
             Console.MessageType.Info,
-            False,
+            log=True,
         )
     except Exception as exc:
-        ConsoleLog(MODULE_NAME, f"[Transfer] Could not file a round report: {exc}", Console.MessageType.Error, False)
+        ConsoleLog(MODULE_NAME, f"[Transfer] Could not file a round report: {exc}", Console.MessageType.Error, log=True)
     finally:
         GLOBAL_CACHE.ShMem.MarkMessageAsFinished(receiver_email, index)
 

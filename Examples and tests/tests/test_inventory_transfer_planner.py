@@ -90,7 +90,10 @@ def live_item(
     stackable: bool = False,
     tradable: bool = True,
     customized: bool = False,
-    item_type: int | None = None,
+    # A live donor read always fills the item type, so a live record that leaves it
+    # unknown is not a case the donor can produce. 30 is ItemType.Trophy: ordinary
+    # junk, and pointedly not ItemType.Quest_Item.
+    item_type: int | None = 30,
     item_id: int = 0,
 ) -> Any:
     return IT.ItemRecord(
@@ -374,6 +377,39 @@ def test_last_kit_protection() -> None:
         len(IT.select_droppable(single, IT.TransferPolicy(keep_last_id_kit=False, keep_last_salvage_kit=False))) == 3,
     )
 
+
+def test_quest_item_protection() -> None:
+    section("quest items are droppable, so the policy has to stop them")
+
+    # Live run 2026-09-03: a quest item reported tradable and hit the ground next to
+    # the junk item. Nothing else in the filter looks at what an item is for.
+    quest = live_item(9001, item_type=IT.QUEST_ITEM_TYPE, tradable=True, customized=False)
+    junk = live_item(IRON, slot=1)
+
+    taken = IT.select_droppable([quest, junk], DEFAULT)
+    check("the quest item stays", [item.model_id for item in taken] == [IRON], repr(taken))
+
+    reasons = dict((item.model_id, result.reason) for item, result in IT.explain_rejections([quest], DEFAULT))
+    check("the refusal is named", reasons.get(9001) == IT.REASON_QUEST_ITEM, repr(reasons))
+
+    # A tradable, uncustomized quest item passes every earlier gate, so this rule has to
+    # be what catches it rather than a side effect of one of the others.
+    permissive = IT.TransferPolicy(keep_last_id_kit=False, keep_last_salvage_kit=False)
+    check("no other rule catches it", IT.select_droppable([quest], permissive) == ())
+
+    check(
+        "protection is switchable",
+        len(IT.select_droppable([quest], IT.TransferPolicy(protect_quest_items=False))) == 1,
+    )
+
+    # The coordinator's snapshot carries no item type, so it cannot prove an item is not
+    # a quest item. Unproven, not allowed -- the donor settles it from its own live read.
+    unseen = IT.ItemRecord(bag_id=1, slot=0, model_id=IRON, quantity=1, tradable=True, customized=False)
+    verdict = IT.evaluate_item(unseen, DEFAULT, IT.build_donor_context([unseen]))
+    check("an unseen item type is unverified", verdict.verdict == IT.VERDICT_UNVERIFIED, repr(verdict))
+    check("and it says why", verdict.reason == IT.REASON_UNKNOWN_ITEM_TYPE, repr(verdict))
+    check("so a donor will not drop it", IT.select_droppable([unseen], DEFAULT) == ())
+    check("but a coordinator may plan it", len(IT.select_plannable([unseen], DEFAULT)) == 1)
 
 def test_deterministic_order() -> None:
     section("both sides walk bags 1 -> 4, slot 0 -> n")
@@ -1057,6 +1093,7 @@ def main() -> int:
     test_selection_gates()
     test_protected_models_and_floors()
     test_last_kit_protection()
+    test_quest_item_protection()
     test_deterministic_order()
     test_round_budgeting()
     test_round_respects_the_budget()
