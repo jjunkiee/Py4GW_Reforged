@@ -650,6 +650,40 @@ def test_policy_registry() -> None:
     check("built-ins are untouched by that", "mine" not in IT.BUILTIN_POLICIES)
 
 
+def test_policy_text_parsers() -> None:
+    section("policy text boxes parse into policy fields")
+
+    check("a plain list parses", IT.parse_model_list("1000, 146") == (1000, 146))
+    check("semicolons work too", IT.parse_model_list("1000; 146") == (1000, 146))
+    check("order is preserved", IT.parse_model_list("146,1000") == (146, 1000))
+    check("duplicates collapse", IT.parse_model_list("1000,1000") == (1000,))
+    check("empty text is an empty tuple", IT.parse_model_list("") == ())
+    check("whitespace-only text is empty", IT.parse_model_list("  ,  ") == ())
+
+    # The user is still typing. A half-finished entry must drop itself, not the
+    # entries that were already valid.
+    check("garbage is dropped, not fatal", IT.parse_model_list("1000, abc, 146") == (1000, 146))
+    check("a trailing comma is harmless", IT.parse_model_list("1000,") == (1000,))
+    check("zero and negatives are not model ids", IT.parse_model_list("0, -5, 1000") == (1000,))
+
+    check("a floor pair parses", IT.parse_model_floors("1000:5") == ((1000, 5),))
+    check("several pairs parse", IT.parse_model_floors("1000:5, 146:2") == ((1000, 5), (146, 2)))
+    check("spacing is ignored", IT.parse_model_floors("  1000 : 5  ") == ((1000, 5),))
+    check("a pair with no colon is dropped", IT.parse_model_floors("1000, 146:2") == ((146, 2),))
+    check("a non-numeric floor is dropped", IT.parse_model_floors("1000:many") == ())
+    check("a zero floor is not a floor", IT.parse_model_floors("1000:0") == ())
+    check("the first entry for a model wins", IT.parse_model_floors("1000:5, 1000:1") == ((1000, 5),))
+
+    # The point of parsing at all: the result has to drive a real policy.
+    policy = IT.TransferPolicy(
+        protected_models=IT.parse_model_list("146"),
+        model_floors=IT.parse_model_floors("1000:200"),
+    )
+    check("parsed protections reach the policy", policy.floor_for(IRON) == 200)
+    held = [snapshot_item(IRON, 250, slot=0), snapshot_item(DYE, 1, slot=1)]
+    check("and both exclusions bite", IT.select_plannable(held, policy) == ())
+
+
 def test_status_codes() -> None:
     section("round status codes survive the c_float round trip")
 
@@ -678,6 +712,306 @@ def test_status_codes() -> None:
     check("an unknown code still reads as something", "unknown" in IT.status_name(99))
 
 
+
+
+# ---------------------------------------------------------------------------
+# 7. The session precheck -- the widget's review gate (plan phase 4)
+# ---------------------------------------------------------------------------
+
+
+class FakeSharedMap:
+    def __init__(self, map_id: int, region: int = 1, district: int = 2, language: int = 3) -> None:
+        self.MapID = map_id
+        self.Region = region
+        self.District = district
+        self.Language = language
+
+
+class FakeSharedHealth:
+    def __init__(self, current: float) -> None:
+        self.Current = current
+
+
+class FakeSharedAgent:
+    def __init__(self, name: str, map_id: int, health: float) -> None:
+        self.CharacterName = name
+        self.Map = FakeSharedMap(map_id)
+        self.Health = FakeSharedHealth(health)
+
+
+class FakeSharedParty:
+    def __init__(self, party_id: int) -> None:
+        self.PartyID = party_id
+
+
+class FakeSharedBags:
+    def __init__(self, bags: Sequence[Any]) -> None:
+        self._bags = tuple(bags)
+
+    def iter_bags(self):
+        return iter(self._bags)
+
+
+class FakeSharedAccount:
+    """Mirrors the AccountStruct fields the precheck adapter reads."""
+
+    def __init__(
+        self,
+        email: str,
+        name: str = "Someone",
+        map_id: int = 42,
+        party_id: int = 7,
+        health: float = 1.0,
+        in_aggro: bool = False,
+        isolation_group: int = 0,
+        isolated: bool = False,
+        bags: Sequence[Any] = (),
+    ) -> None:
+        self.AccountEmail = email
+        self.AgentData = FakeSharedAgent(name, map_id, health)
+        self.AgentPartyData = FakeSharedParty(party_id)
+        self.InventoryBags = FakeSharedBags(bags)
+        self.IsolationGroupID = isolation_group
+        self.IsIsolated = isolated
+        self.InAggro = in_aggro
+
+
+def participant(key: str, **overrides: Any) -> Any:
+    """A participant that passes every check unless an override breaks one."""
+    settings: dict[str, Any] = dict(
+        name=key.title(),
+        map_id=42,
+        region=1,
+        district=2,
+        language=3,
+        party_id=7,
+        explorable=True,
+        health=1.0,
+        inventory=receiver(10),
+    )
+    settings.update(overrides)
+    return IT.ParticipantState(key=key, **settings)
+
+
+def named(results: Sequence[Any], name: str) -> Any:
+    for result in results:
+        if result.name == name:
+            return result
+    raise AssertionError("no precheck named %r" % name)
+
+
+def test_precheck_adapter() -> None:
+    section("shared-memory account to participant state")
+
+    account = FakeSharedAccount(
+        "donor@example.com",
+        name="Donor One",
+        bags=[FakeSharedBag(1, 4, [(IRON, 250), (DYE, 1)])],
+    )
+    state = IT.participant_from_shared_account(account, explorable=True)
+
+    check("the email is the session key", state.key == "donor@example.com")
+    check("the character name is the label", state.label == "Donor One")
+    check("instance identity carries map and party", state.instance_key == (42, 1, 2, 3, 7))
+    check("bags come through the one adapter", state.inventory.used_slots == 2 and state.inventory.free_slots == 2)
+    check("the caller owns the explorable answer", state.explorable is True)
+    check("an unanswered explorable stays unresolved", IT.participant_from_shared_account(account).explorable is None)
+    check("full health is alive", state.alive is True)
+    corpse = IT.participant_from_shared_account(FakeSharedAccount("x", health=0.0))
+    check("zero health is not alive", corpse.alive is False)
+    check("a state converts to a donor snapshot", state.as_donor().key == "donor@example.com")
+    check("an email with no character name still labels", IT.ParticipantState(key="only@mail").label == "only@mail")
+
+
+def test_precheck_can_communicate() -> None:
+    section("the isolation mirror agrees with AllAccounts._can_communicate")
+
+    solo = participant("solo", party_id=0, isolation_group=0)
+    check("an account may always reach itself", IT.can_communicate(solo, solo) is True)
+
+    a = participant("a", party_id=7, isolation_group=1)
+    b = participant("b", party_id=7, isolation_group=2)
+    check("a shared party beats mismatched isolation groups", IT.can_communicate(a, b) is True)
+
+    c = participant("c", party_id=0, isolation_group=1)
+    d = participant("d", party_id=0, isolation_group=2)
+    check("mismatched groups without a party are blocked", IT.can_communicate(c, d) is False)
+    same_group = participant("e", party_id=0, isolation_group=1)
+    check("matching groups without a party are fine", IT.can_communicate(c, same_group) is True)
+    check("one grouped and one not is blocked", IT.can_communicate(c, participant("f", party_id=0)) is False)
+
+    lonely = participant("g", party_id=0, isolated=True)
+    check("legacy isolation blocks the ungrouped", IT.can_communicate(lonely, participant("h", party_id=0)) is False)
+    plain_one = participant("i", party_id=0)
+    plain_two = participant("j", party_id=0)
+    check("two plain ungrouped accounts talk", IT.can_communicate(plain_one, plain_two) is True)
+
+
+def test_precheck_passes_a_sound_session() -> None:
+    section("a sound session passes every check")
+
+    home = participant("receiver", inventory=receiver(6))
+    away = participant("donor", inventory=one_bag([snapshot_item(IRON, 250)]))
+    results = IT.precheck_session(home, home, [away], DEFAULT)
+
+    check("every check reports", len(results) == 7, repr([r.name for r in results]))
+    failed = [(r.name, r.state, r.detail) for r in results if not r.passed]
+    check("all of them pass", IT.precheck_passed(results), repr(failed))
+    check("the roles line names the receiver", "receiver" in named(results, IT.CHECK_ROLES).detail.lower())
+    check(
+        "usable free slots exclude the safety margin",
+        named(results, IT.CHECK_RECEIVER_SPACE).detail.startswith("5 "),
+        named(results, IT.CHECK_RECEIVER_SPACE).detail,
+    )
+
+
+def test_precheck_catches_each_failure() -> None:
+    section("each precheck fails for its own reason")
+
+    home = participant("receiver", inventory=receiver(6))
+    away = participant("donor", inventory=one_bag([snapshot_item(IRON, 250)]))
+
+    def check_state(label: str, results: Sequence[Any], name: str, state: str) -> None:
+        result = named(results, name)
+        check(label, result.state == state, "%s -> %s %r" % (name, result.state, result.detail))
+
+    check_state(
+        "no donor selected fails the roles check",
+        IT.precheck_session(home, home, [], DEFAULT),
+        IT.CHECK_ROLES,
+        IT.CHECK_FAIL,
+    )
+    check_state(
+        "the receiver cannot also donate",
+        IT.precheck_session(home, home, [home], DEFAULT),
+        IT.CHECK_ROLES,
+        IT.CHECK_FAIL,
+    )
+    check_state(
+        "an outpost fails the explorable check",
+        IT.precheck_session(home, home, [participant("donor", explorable=False)], DEFAULT),
+        IT.CHECK_EXPLORABLE,
+        IT.CHECK_FAIL,
+    )
+    check_state(
+        "an unknown instance type is unresolved, not a pass",
+        IT.precheck_session(home, home, [participant("donor", explorable=None)], DEFAULT),
+        IT.CHECK_EXPLORABLE,
+        IT.CHECK_UNKNOWN,
+    )
+    check_state(
+        "a different map fails the instance check",
+        IT.precheck_session(home, home, [participant("donor", map_id=43)], DEFAULT),
+        IT.CHECK_SAME_INSTANCE,
+        IT.CHECK_FAIL,
+    )
+    check_state(
+        "a different district fails the instance check",
+        IT.precheck_session(home, home, [participant("donor", district=9)], DEFAULT),
+        IT.CHECK_SAME_INSTANCE,
+        IT.CHECK_FAIL,
+    )
+    check_state(
+        "nobody in a party fails the instance check",
+        IT.precheck_session(
+            participant("receiver", party_id=0),
+            participant("receiver", party_id=0),
+            [participant("donor", party_id=0)],
+            DEFAULT,
+        ),
+        IT.CHECK_SAME_INSTANCE,
+        IT.CHECK_FAIL,
+    )
+    check_state(
+        "aggro fails the combat check",
+        IT.precheck_session(home, home, [participant("donor", in_aggro=True)], DEFAULT),
+        IT.CHECK_COMBAT_FREE,
+        IT.CHECK_FAIL,
+    )
+    check_state(
+        "a corpse fails the combat check",
+        IT.precheck_session(home, home, [participant("donor", health=0.0)], DEFAULT),
+        IT.CHECK_COMBAT_FREE,
+        IT.CHECK_FAIL,
+    )
+    check_state(
+        "a full receiver fails the space check",
+        IT.precheck_session(
+            participant("receiver", inventory=receiver(0)),
+            participant("receiver", inventory=receiver(0)),
+            [away],
+            DEFAULT,
+        ),
+        IT.CHECK_RECEIVER_SPACE,
+        IT.CHECK_FAIL,
+    )
+    check_state(
+        "a receiver with only the margin free fails the space check",
+        IT.precheck_session(
+            participant("receiver", inventory=receiver(1)),
+            participant("receiver", inventory=receiver(1)),
+            [away],
+            DEFAULT,
+        ),
+        IT.CHECK_RECEIVER_SPACE,
+        IT.CHECK_FAIL,
+    )
+    check_state(
+        "one free slot is enough with no margin",
+        IT.precheck_session(
+            participant("receiver", inventory=receiver(1)),
+            participant("receiver", inventory=receiver(1)),
+            [away],
+            NO_MARGIN,
+        ),
+        IT.CHECK_RECEIVER_SPACE,
+        IT.CHECK_PASS,
+    )
+    check_state(
+        "a running session refuses a second one",
+        IT.precheck_session(home, home, [away], DEFAULT, session_busy=True),
+        IT.CHECK_SESSION_FREE,
+        IT.CHECK_FAIL,
+    )
+
+    # An isolated coordinator that is not in the party cannot reach anyone.
+    outsider = participant("coordinator", party_id=0, isolation_group=5)
+    check_state(
+        "isolation blocks the coordinator",
+        IT.precheck_session(outsider, home, [away], DEFAULT),
+        IT.CHECK_CAN_COMMUNICATE,
+        IT.CHECK_FAIL,
+    )
+
+    check(
+        "an unresolved check is not a pass",
+        not IT.precheck_passed(IT.precheck_session(home, home, [participant("donor", explorable=None)], DEFAULT)),
+    )
+
+
+def test_coordinator_exclusions_are_proven_only() -> None:
+    section("the preview lists proven exclusions, not unknowns")
+
+    items = [snapshot_item(IRON, 250, slot=0), snapshot_item(DYE, 1, slot=1)]
+    policy = IT.TransferPolicy(protected_models=(DYE,))
+
+    excluded = IT.explain_exclusions(items, policy)
+    check("only the proven-protected item is excluded", len(excluded) == 1, repr(excluded))
+    check("and it carries the reason", excluded[0][1].reason == IT.REASON_PROTECTED_MODEL)
+    check("the plannable item survives", IT.select_plannable(items, policy)[0].model_id == IRON)
+
+    # The droppable explainer is the donor's view and rejects both, because a
+    # snapshot cannot prove tradability. That is exactly why the preview needs
+    # its own explainer rather than reusing this one.
+    rejected = IT.explain_rejections(items, policy)
+    check("the droppable explainer rejects both", len(rejected) == 2, repr(rejected))
+    check(
+        "the unproven one is only unverified",
+        any(result.verdict == IT.VERDICT_UNVERIFIED for _item, result in rejected),
+        repr(rejected),
+    )
+
+
 def main() -> int:
     test_planner_stays_client_free()
     test_slot_cost_conservative_branch()
@@ -698,7 +1032,13 @@ def main() -> int:
     test_reconcile_round()
     test_shared_memory_adapter()
     test_policy_registry()
+    test_policy_text_parsers()
     test_status_codes()
+    test_precheck_adapter()
+    test_precheck_can_communicate()
+    test_precheck_passes_a_sound_session()
+    test_precheck_catches_each_failure()
+    test_coordinator_exclusions_are_proven_only()
 
     print("\n" + "-" * 60)
     if FAILURES:
