@@ -628,6 +628,56 @@ def test_shared_memory_adapter() -> None:
     check("quantity_of totals a model", snapshot.quantity_of(IRON) == 250)
 
 
+def test_policy_registry() -> None:
+    section("named policies resolve the same on both sides")
+
+    default = IT.resolve_policy("default")
+    check("the default policy is the conservative one", default.optimistic_merge is False and default.safety_margin == 1)
+    check("an unknown name falls back to default", IT.resolve_policy("no-such-policy").name == IT.DEFAULT_POLICY_NAME)
+    check("an empty name falls back to default", IT.resolve_policy("").name == IT.DEFAULT_POLICY_NAME)
+    check("names are case- and space-insensitive", IT.resolve_policy("  Stackables ").stackables_only is True)
+    check("optimistic is opt-in by name", IT.resolve_policy("optimistic").optimistic_merge is True)
+    check(
+        "every built-in policy is named after its key",
+        all(name == policy.name for name, policy in IT.BUILTIN_POLICIES.items()),
+        repr(IT.BUILTIN_POLICIES),
+    )
+
+    # A widget must be able to add user policies without the planner growing a
+    # mutable global, and a user policy may shadow a built-in one.
+    custom = IT.TransferPolicy(name="mine", protected_models=(IRON,))
+    check("caller-supplied policies win", IT.resolve_policy("mine", {"mine": custom}) is custom)
+    check("built-ins are untouched by that", "mine" not in IT.BUILTIN_POLICIES)
+
+
+def test_status_codes() -> None:
+    section("round status codes survive the c_float round trip")
+
+    codes = [
+        IT.STATUS_OK,
+        IT.STATUS_BUSY,
+        IT.STATUS_NOT_EXPLORABLE,
+        IT.STATUS_NOTHING_ELIGIBLE,
+        IT.STATUS_RALLY_FAILED,
+        IT.STATUS_ERROR,
+        IT.STATUS_NO_BUDGET,
+        IT.STATUS_INVENTORY_FULL,
+    ]
+    check("codes are distinct", len(set(codes)) == len(codes), repr(codes))
+    check("ok is falsy so a plain truth test cannot invert it", IT.STATUS_OK == 0)
+    check(
+        "every code round-trips through a float exactly",
+        all(int(float(code)) == code for code in codes),
+    )
+    check("every code has a name", all(IT.status_name(code) != "" for code in codes))
+    check(
+        "every code is in STATUS_NAMES",
+        all(code in IT.STATUS_NAMES for code in codes),
+        repr(sorted(IT.STATUS_NAMES)),
+    )
+    check("an unknown code still reads as something", "unknown" in IT.status_name(99))
+
+
 def main() -> int:
     test_planner_stays_client_free()
     test_slot_cost_conservative_branch()
@@ -647,6 +697,8 @@ def main() -> int:
     test_stall_detection()
     test_reconcile_round()
     test_shared_memory_adapter()
+    test_policy_registry()
+    test_status_codes()
 
     print("\n" + "-" * 60)
     if FAILURES:

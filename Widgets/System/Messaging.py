@@ -8,12 +8,13 @@ import Py4GW
 import ctypes
 
 from Py4GWCoreLib.HeroAI.cache_data import CacheData
-from Py4GWCoreLib import GLOBAL_CACHE, Player, Map, Agent, Effects, Inventory, Party
+from Py4GWCoreLib import GLOBAL_CACHE, Player, Map, Agent, AgentArray, Effects, Inventory, Party
 from Py4GWCoreLib import ActionQueueManager
 from Py4GWCoreLib import CombatPrepSkillsType
 from Py4GWCoreLib import Console
 from Py4GWCoreLib import ConsoleLog
 from Py4GWCoreLib.py4gwcorelib_src.system_settings.loot_filters import LootFilters
+from Py4GWCoreLib.py4gwcorelib_src import inventory_transfer as InventoryTransfer
 import PyImGui
 import PySystem
 from Py4GWCoreLib import Range, TitleID
@@ -790,6 +791,8 @@ _HERO_AI_SUSPENDING_COMMANDS = {
     SharedCommandType.UseSkill,
     SharedCommandType.DisableHeroAI,
     SharedCommandType.UseSkillCombatPrep,
+    SharedCommandType.TransferDropItems,
+    SharedCommandType.TransferPickUpItems,
 }
 
 
@@ -3524,6 +3527,469 @@ def AccountSettingsSyncResult(index: int, message: SharedMessageStruct) -> None:
 # endregion
 
 
+# region Cross-account inventory transfer
+
+# Drop-and-collect ferry, phase 3 of `docs/loot/plans/cross-account-inventory-transfer.md`.
+#
+# The coordinator owns the budget, the participant owns the selection: a drop command
+# carries a count budget plus a policy name and never an item manifest, because
+# SharedMessageStruct offers four floats and four 63-character strings and an item list
+# fits in neither. The donor resolves the item ids from its own live bag read, which is
+# also the only read that can see tradability -- the coordinator's shared-memory snapshot
+# carries model ids and quantities and nothing else.
+
+# One transfer step at a time per client. ProcessMessages() dispatches a fresh coroutine
+# every frame, so two overlapping sessions would otherwise have two coroutines dropping
+# and walking at once. A refused step reports STATUS_BUSY instead of queueing: the
+# coordinator can simply try again next round.
+_transfer_busy: bool = False
+
+# A donor already standing on the pile should not walk a lap to prove it.
+_TRANSFER_RALLY_TOLERANCE = 150.0
+_TRANSFER_RALLY_TIMEOUT_MS = 20000
+
+
+@dataclass(frozen=True)
+class TransferReportEntry:
+    """One participant's result for one round, as the coordinator files it."""
+
+    session_id: str
+    round_id: int
+    reporter_email: str
+    items_moved: int
+    slots_used: int
+    status: int
+    timestamp: int
+
+    @property
+    def ok(self) -> bool:
+        return self.status == InventoryTransfer.STATUS_OK
+
+    @property
+    def status_text(self) -> str:
+        return InventoryTransfer.status_name(self.status)
+
+
+def _transfer_report_cache() -> dict[tuple[str, int, str], TransferReportEntry]:
+    """Round reports, parked on GLOBAL_CACHE so a widget reload cannot lose one in flight.
+
+    The attribute is dynamic by design -- GLOBAL_CACHE does not declare it -- so the store
+    goes through setattr rather than a direct assignment the type checker would (rightly)
+    flag against the declared class.
+    """
+    cache = getattr(GLOBAL_CACHE, "_transfer_round_reports", None)
+    if cache is None:
+        cache = {}
+        setattr(GLOBAL_CACHE, "_transfer_round_reports", cache)
+    return cache
+
+
+def get_transfer_reports(session_id: str, round_id: int | None = None) -> tuple[TransferReportEntry, ...]:
+    """Every report filed for a session, optionally narrowed to one round."""
+    session = str(session_id or "").strip()
+    entries = [
+        entry
+        for (entry_session, entry_round, _reporter), entry in _transfer_report_cache().items()
+        if entry_session == session and (round_id is None or entry_round == int(round_id))
+    ]
+    entries.sort(key=lambda entry: (entry.round_id, entry.reporter_email))
+    return tuple(entries)
+
+
+def clear_transfer_reports(session_id: str, round_id: int | None = None) -> None:
+    """Forget a session's reports once the coordinator has reconciled them."""
+    session = str(session_id or "").strip()
+    cache = _transfer_report_cache()
+    stale = [key for key in cache if key[0] == session and (round_id is None or key[1] == int(round_id))]
+    for key in stale:
+        cache.pop(key, None)
+
+
+def _send_transfer_report(
+    coordinator_email: str,
+    reporter_email: str,
+    session_id: str,
+    round_id: int,
+    items_moved: int,
+    slots_used: int,
+    status: int,
+) -> None:
+    """Answer the coordinator with what this participant actually did.
+
+    The round id in Params[0] is what defeats SendMessage's dedup: two rounds that moved
+    the same count would otherwise collapse into one slot and the second report would
+    never arrive. Sent from each handler's `finally`, so a round that died still answers.
+    """
+    if not coordinator_email or not reporter_email:
+        return
+
+    GLOBAL_CACHE.ShMem.SendMessage(
+        reporter_email,
+        coordinator_email,
+        SharedCommandType.TransferReport,
+        (float(round_id), float(items_moved), float(slots_used), float(status)),
+        (str(session_id or ""), reporter_email, "", ""),
+    )
+
+
+def _read_local_transfer_items() -> list[InventoryTransfer.ItemRecord]:
+    """Read bags 1-4 into planner records, in the order both sides walk them.
+
+    Same bag and slot order as the shared-memory publisher in
+    `AccountStruct._update_inventory_bags`, so a donor's own selection lines up with the
+    coordinator's projection. Every tri-state flag is filled in here because this is the
+    live read: an unfilled flag leaves the item merely plannable and never droppable,
+    which is the planner's whole point.
+    """
+    records: list[InventoryTransfer.ItemRecord] = []
+
+    for bag_id in InventoryTransfer.INVENTORY_BAG_IDS:
+        bag = GLOBAL_CACHE.ItemArray.GetBag(bag_id)
+        if bag is None:
+            continue
+
+        try:
+            items = bag.GetItems()
+        except Exception as exc:
+            ConsoleLog(MODULE_NAME, f"[Transfer] Could not read bag {bag_id}: {exc}", Console.MessageType.Warning, False)
+            continue
+
+        for item in items:
+            item_id = int(getattr(item, "item_id", 0) or 0)
+            slot = int(getattr(item, "slot", -1) or -1)
+            if item_id == 0 or slot < 0:
+                continue
+
+            model_id = int(getattr(item, "model_id", 0) or 0) or int(GLOBAL_CACHE.Item.GetModelID(item_id))
+            quantity = int(getattr(item, "quantity", 0) or 0) or int(GLOBAL_CACHE.Item.Properties.GetQuantity(item_id))
+            item_type = int(GLOBAL_CACHE.Item.GetItemType(item_id)[0])
+            is_id_kit = bool(GLOBAL_CACHE.Item.Usage.IsIDKit(item_id)) or model_id in InventoryTransfer.ID_KIT_MODELS
+            is_salvage_kit = (
+                bool(GLOBAL_CACHE.Item.Usage.IsSalvageKit(item_id)) or model_id in InventoryTransfer.SALVAGE_KIT_MODELS
+            )
+
+            records.append(
+                InventoryTransfer.ItemRecord(
+                    bag_id=bag_id,
+                    slot=slot,
+                    model_id=model_id,
+                    quantity=max(quantity, 1),
+                    item_id=item_id,
+                    stackable=bool(GLOBAL_CACHE.Item.Properties.IsStackable(item_id)),
+                    tradable=bool(GLOBAL_CACHE.Item.Properties.IsTradable(item_id)),
+                    customized=bool(GLOBAL_CACHE.Item.Properties.IsCustomized(item_id)),
+                    item_type=item_type,
+                    is_id_kit=is_id_kit,
+                    is_salvage_kit=is_salvage_kit,
+                )
+            )
+
+    records.sort(key=lambda record: record.sort_key)
+    return records
+
+
+def _transfer_ground_item_ids(center: tuple[float, float], radius: float) -> set[int]:
+    """Ground items at the rally point this character is allowed to take.
+
+    Same predicate as `Items.LootGroundItems`: unowned, or still reserved for us, which is
+    what recalling our own drop needs. Counted before and after a collect so the report
+    carries items that actually left the ground rather than a free-slot delta, which stack
+    merges hide.
+    """
+    own_agent_id = Player.GetAgentID()
+    candidates = AgentArray.Filter.ByDistance(AgentArray.GetItemArray(), center, radius)
+
+    collectable: set[int] = set()
+    for agent_id in candidates:
+        owner_id = Agent.GetItemAgentOwnerID(agent_id)
+        if owner_id == 0 or owner_id == own_agent_id:
+            collectable.add(int(agent_id))
+    return collectable
+
+
+def TransferDropItems(index: int, message: SharedMessageStruct):
+    """Donor side of one round: drop up to a budget of whole stacks at the rally point.
+
+    Params: (round_id, max_items, rally_x, rally_y).
+    ExtraData: (policy_name, session_id, "", "").
+
+    Snapshot/restore of the HeroAI options is a strict stack, so doing it here nests
+    safely inside a session-scoped DisableHeroAI: the inner restore puts back options that
+    were already suspended, and the session's own restore still returns the user's real
+    settings.
+    """
+    global _transfer_busy
+
+    donor_email = str(message.ReceiverEmail or "")
+    coordinator_email = str(message.SenderEmail or "")
+    round_id = int(message.Params[0])
+    max_items = int(message.Params[1])
+    rally_x = float(message.Params[2])
+    rally_y = float(message.Params[3])
+    policy_name, session_id, _extra2, _extra3 = _extra_data(message)
+
+    status = InventoryTransfer.STATUS_OK
+    items_dropped = 0
+    slots_freed = 0
+    holds_lock = False
+    suspended = False
+
+    GLOBAL_CACHE.ShMem.MarkMessageAsRunning(donor_email, index)
+    try:
+        if _transfer_busy:
+            status = InventoryTransfer.STATUS_BUSY
+            ConsoleLog(
+                MODULE_NAME,
+                f"[Transfer] Round {round_id}: another transfer step is running, refusing the drop.",
+                Console.MessageType.Warning,
+                False,
+            )
+            return
+
+        _transfer_busy = True
+        holds_lock = True
+
+        if not Routines.Checks.Map.IsExplorable():
+            # A5: dropping is refused outside explorable areas. Reported rather than
+            # attempted, so the coordinator learns why the round did nothing.
+            status = InventoryTransfer.STATUS_NOT_EXPLORABLE
+            ConsoleLog(
+                MODULE_NAME,
+                f"[Transfer] Round {round_id}: not in an explorable area, dropping nothing.",
+                Console.MessageType.Warning,
+                False,
+            )
+            return
+
+        if max_items <= 0:
+            status = InventoryTransfer.STATUS_NO_BUDGET
+            ConsoleLog(
+                MODULE_NAME,
+                f"[Transfer] Round {round_id}: no drop budget was granted.",
+                Console.MessageType.Warning,
+                False,
+            )
+            return
+
+        SnapshotHeroAIOptions(donor_email)
+        DisableHeroAIOptions(donor_email)
+        suspended = True
+
+        if rally_x or rally_y:
+            if Utils.Distance(Player.GetXY(), (rally_x, rally_y)) > _TRANSFER_RALLY_TOLERANCE:
+                reached = yield from Routines.Yield.Movement.FollowPath(
+                    [(rally_x, rally_y)],
+                    timeout=_TRANSFER_RALLY_TIMEOUT_MS,
+                )
+                if not reached:
+                    # No fallback drop on purpose: a pile scattered along a failed path is
+                    # worse than a round that moved nothing, because the receiver only
+                    # walks the rally point.
+                    status = InventoryTransfer.STATUS_RALLY_FAILED
+                    ConsoleLog(
+                        MODULE_NAME,
+                        f"[Transfer] Round {round_id}: could not reach the rally point, dropping nothing.",
+                        Console.MessageType.Warning,
+                        False,
+                    )
+                    return
+
+        policy = InventoryTransfer.resolve_policy(policy_name)
+        droppable = InventoryTransfer.select_droppable(_read_local_transfer_items(), policy)[:max_items]
+        if not droppable:
+            status = InventoryTransfer.STATUS_NOTHING_ELIGIBLE
+            ConsoleLog(
+                MODULE_NAME,
+                f"[Transfer] Round {round_id}: nothing eligible under policy {policy.name}.",
+                Console.MessageType.Info,
+                False,
+            )
+            return
+
+        free_before = int(GLOBAL_CACHE.Inventory.GetFreeSlotCount())
+        dropped = yield from Routines.Yield.Items.DropItems([record.item_id for record in droppable])
+        items_dropped = len(dropped)
+        slots_freed = max(int(GLOBAL_CACHE.Inventory.GetFreeSlotCount()) - free_before, 0)
+
+        if items_dropped == 0:
+            # Eligible items that all refused to leave the bags is a real failure, not an
+            # empty inventory: say so rather than reporting a clean round of nothing.
+            status = InventoryTransfer.STATUS_ERROR
+
+        ConsoleLog(
+            MODULE_NAME,
+            f"[Transfer] Round {round_id}: dropped {items_dropped} of {len(droppable)} planned item(s), freeing {slots_freed} slot(s).",
+            Console.MessageType.Info,
+            False,
+        )
+    except Exception as exc:
+        status = InventoryTransfer.STATUS_ERROR
+        ConsoleLog(MODULE_NAME, f"[Transfer] Drop round {round_id} failed: {exc}", Console.MessageType.Error, False)
+    finally:
+        if suspended:
+            RestoreHeroAISnapshot(donor_email)
+        if holds_lock:
+            _transfer_busy = False
+        _send_transfer_report(coordinator_email, donor_email, session_id, round_id, items_dropped, slots_freed, status)
+        GLOBAL_CACHE.ShMem.MarkMessageAsFinished(donor_email, index)
+
+
+def TransferPickUpItems(index: int, message: SharedMessageStruct):
+    """Receiver side of one round: walk the pile at the rally point and collect it.
+
+    Params: (round_id, max_items, radius, unused).
+    ExtraData: (session_id, "", "", "").
+
+    Reports like a donor does. The plan only required donor reports, but the receiver's
+    report is the one edge that says a round is over: without it the coordinator would
+    have to infer completion from a shared-memory snapshot that is up to 1.5 s stale. It
+    costs one message per round and no new command.
+    """
+    global _transfer_busy
+
+    receiver_email = str(message.ReceiverEmail or "")
+    coordinator_email = str(message.SenderEmail or "")
+    round_id = int(message.Params[0])
+    max_items = int(message.Params[1])
+    radius = float(message.Params[2]) or float(Range.Earshot.value)
+    session_id, _extra1, _extra2, _extra3 = _extra_data(message)
+
+    status = InventoryTransfer.STATUS_OK
+    items_collected = 0
+    slots_used = 0
+    holds_lock = False
+    suspended = False
+
+    GLOBAL_CACHE.ShMem.MarkMessageAsRunning(receiver_email, index)
+    try:
+        if _transfer_busy:
+            status = InventoryTransfer.STATUS_BUSY
+            ConsoleLog(
+                MODULE_NAME,
+                f"[Transfer] Round {round_id}: another transfer step is running, refusing the pickup.",
+                Console.MessageType.Warning,
+                False,
+            )
+            return
+
+        _transfer_busy = True
+        holds_lock = True
+
+        if not Routines.Checks.Map.IsExplorable():
+            status = InventoryTransfer.STATUS_NOT_EXPLORABLE
+            ConsoleLog(
+                MODULE_NAME,
+                f"[Transfer] Round {round_id}: not in an explorable area, collecting nothing.",
+                Console.MessageType.Warning,
+                False,
+            )
+            return
+
+        # The rally point is where the receiver stands when the round starts. It walks the
+        # pile from there, so every later read uses this fixed centre rather than the
+        # current position.
+        rally_point = Player.GetXY()
+
+        # Suspend before counting the pile: this client's own HeroAI Looting would
+        # otherwise be free to take an item between the count and the collect, and the
+        # report would blame the difference on the transfer.
+        SnapshotHeroAIOptions(receiver_email)
+        DisableHeroAIOptions(receiver_email)
+        suspended = True
+
+        before = _transfer_ground_item_ids(rally_point, radius)
+        if not before:
+            status = InventoryTransfer.STATUS_NOTHING_ELIGIBLE
+            ConsoleLog(
+                MODULE_NAME,
+                f"[Transfer] Round {round_id}: no free ground items within {int(radius)} of the rally point.",
+                Console.MessageType.Info,
+                False,
+            )
+            return
+
+        free_before = int(GLOBAL_CACHE.Inventory.GetFreeSlotCount())
+        collected_all = yield from Routines.Yield.Items.LootGroundItems(
+            radius=radius,
+            max_items=max(max_items, 0),
+            center=rally_point,
+        )
+        slots_used = max(free_before - int(GLOBAL_CACHE.Inventory.GetFreeSlotCount()), 0)
+        # Everything that left the ground. A party member looting the same pile would
+        # inflate this; HeroAI is suspended on every participant precisely so it does not.
+        items_collected = len(before - _transfer_ground_item_ids(rally_point, radius))
+
+        if not collected_all:
+            if int(GLOBAL_CACHE.Inventory.GetFreeSlotCount()) <= 0:
+                status = InventoryTransfer.STATUS_INVENTORY_FULL
+            else:
+                status = InventoryTransfer.STATUS_ERROR
+
+        ConsoleLog(
+            MODULE_NAME,
+            f"[Transfer] Round {round_id}: collected {items_collected} of {len(before)} ground item(s), filling {slots_used} slot(s).",
+            Console.MessageType.Info,
+            False,
+        )
+    except Exception as exc:
+        status = InventoryTransfer.STATUS_ERROR
+        ConsoleLog(MODULE_NAME, f"[Transfer] Pickup round {round_id} failed: {exc}", Console.MessageType.Error, False)
+    finally:
+        if suspended:
+            RestoreHeroAISnapshot(receiver_email)
+        if holds_lock:
+            _transfer_busy = False
+        _send_transfer_report(
+            coordinator_email, receiver_email, session_id, round_id, items_collected, slots_used, status
+        )
+        GLOBAL_CACHE.ShMem.MarkMessageAsFinished(receiver_email, index)
+
+
+def TransferReport(index: int, message: SharedMessageStruct) -> None:
+    """Coordinator side: file one participant's round result for the session to reconcile.
+
+    Params: (round_id, items_moved, slots_used, status).
+    ExtraData: (session_id, reporter_email, "", "").
+
+    A plain function rather than a coroutine, following the AccountSettingsSyncResult
+    precedent: there is nothing here to wait for.
+    """
+    receiver_email = str(message.ReceiverEmail or "")
+    GLOBAL_CACHE.ShMem.MarkMessageAsRunning(receiver_email, index)
+    try:
+        round_id = int(message.Params[0])
+        items_moved = int(message.Params[1])
+        slots_used = int(message.Params[2])
+        status = int(message.Params[3])
+        session_id, reporter_email, _extra2, _extra3 = _extra_data(message)
+        reporter_email = str(reporter_email or message.SenderEmail or "").strip()
+
+        entry = TransferReportEntry(
+            session_id=str(session_id or "").strip(),
+            round_id=round_id,
+            reporter_email=reporter_email,
+            items_moved=items_moved,
+            slots_used=slots_used,
+            status=status,
+            timestamp=int(PySystem.get_tick_count64()),
+        )
+        _transfer_report_cache()[(entry.session_id, entry.round_id, entry.reporter_email)] = entry
+
+        ConsoleLog(
+            MODULE_NAME,
+            f"[Transfer] Round {round_id} report from {reporter_email}: {items_moved} item(s), {slots_used} slot(s), {entry.status_text}.",
+            Console.MessageType.Info,
+            False,
+        )
+    except Exception as exc:
+        ConsoleLog(MODULE_NAME, f"[Transfer] Could not file a round report: {exc}", Console.MessageType.Error, False)
+    finally:
+        GLOBAL_CACHE.ShMem.MarkMessageAsFinished(receiver_email, index)
+
+
+# endregion
+
+
 # region ProcessMessages
 def ProcessMessages():
     account_email = Player.GetAccountEmail()
@@ -3657,6 +4123,12 @@ def ProcessMessages():
             GLOBAL_CACHE.Coroutines.append(CollectorExchange(index, message))
         case SharedCommandType.AddModelToLootWhitelist:
             GLOBAL_CACHE.Coroutines.append(AddModelToLootWhitelist(index, message))
+        case SharedCommandType.TransferDropItems:
+            GLOBAL_CACHE.Coroutines.append(TransferDropItems(index, message))
+        case SharedCommandType.TransferPickUpItems:
+            GLOBAL_CACHE.Coroutines.append(TransferPickUpItems(index, message))
+        case SharedCommandType.TransferReport:
+            TransferReport(index, message)
         case SharedCommandType.AccountSettingsSync:
             AccountSettingsSync(index, message)
         case SharedCommandType.AccountSettingsSyncResult:

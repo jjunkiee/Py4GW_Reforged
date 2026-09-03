@@ -348,6 +348,36 @@ class TransferPolicy:
         return 0
 
 
+#: The policy a `TransferDropItems` message means when it names nothing, or
+#: names something this build does not know.
+DEFAULT_POLICY_NAME = "default"
+
+#: Policies both sides can resolve from a name alone. `ExtraData` carries 63
+#: characters, not a serialized policy, so the name is the whole contract: the
+#: coordinator budgets with one of these and the donor filters with the same
+#: one. A donor running an older build than the coordinator resolves an unknown
+#: name to `default`, which is the most conservative entry -- that direction of
+#: mismatch drops fewer items, never more.
+BUILTIN_POLICIES: dict[str, TransferPolicy] = {
+    "default": TransferPolicy(name="default"),
+    "stackables": TransferPolicy(name="stackables", stackables_only=True),
+    "optimistic": TransferPolicy(name="optimistic", optimistic_merge=True),
+}
+
+
+def resolve_policy(name: str, extra: dict[str, TransferPolicy] | None = None) -> TransferPolicy:
+    """Resolve a policy name to a policy, falling back to the conservative default.
+
+    `extra` lets a widget register user-defined policies without the planner
+    growing a mutable global; it is searched first so a user policy may shadow a
+    built-in one by name.
+    """
+    key = str(name or "").strip().lower()
+    if extra and key in extra:
+        return extra[key]
+    return BUILTIN_POLICIES.get(key, BUILTIN_POLICIES[DEFAULT_POLICY_NAME])
+
+
 @dataclass(frozen=True)
 class DonorContext:
     """Donor-wide totals the per-item checks need.
@@ -890,3 +920,37 @@ def reconcile_round(
         on_ground=on_ground,
         stalled=stalled,
     )
+
+
+# --- Round status codes ----------------------------------------------------
+
+# `TransferReport` carries its status in `Params[3]`, which is a c_float: keep
+# these small integers so the float round-trip is exact. They live here rather
+# than in the message handler because the coordinator and the participant have
+# to read the same vocabulary, and this module is the one both sides already
+# import.
+
+STATUS_OK = 0
+STATUS_BUSY = 1
+STATUS_NOT_EXPLORABLE = 2
+STATUS_NOTHING_ELIGIBLE = 3
+STATUS_RALLY_FAILED = 4
+STATUS_ERROR = 5
+STATUS_NO_BUDGET = 6
+STATUS_INVENTORY_FULL = 7
+
+STATUS_NAMES: dict[int, str] = {
+    STATUS_OK: "ok",
+    STATUS_BUSY: "another transfer is already running",
+    STATUS_NOT_EXPLORABLE: "not in an explorable area",
+    STATUS_NOTHING_ELIGIBLE: "nothing eligible to move",
+    STATUS_RALLY_FAILED: "could not reach the rally point",
+    STATUS_ERROR: "failed with an error",
+    STATUS_NO_BUDGET: "no budget was granted",
+    STATUS_INVENTORY_FULL: "receiver inventory is full",
+}
+
+
+def status_name(status: int) -> str:
+    """Human-readable form of a report status, for the UI and the console."""
+    return STATUS_NAMES.get(int(status), "unknown status %d" % int(status))
