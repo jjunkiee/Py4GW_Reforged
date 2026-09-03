@@ -156,6 +156,11 @@ class AccountRow:
     map_id: int
     is_local: bool
 
+    #: True only when the free-slot count came from this client's own bag read.
+    #: A peer's capacity arrives through a shared-memory field that is currently
+    #: publishing its item count instead, so its free slots are not reportable.
+    capacity_is_trusted: bool = False
+
     @property
     def label(self) -> str:
         return self.state.label
@@ -266,21 +271,35 @@ class InventoryTransferWidget:
         local_email = str(Player.GetAccountEmail() or "")
         rows: list[AccountRow] = []
 
+        # Shared memory does not publish a capacity worth trusting, so this
+        # client corrects its own row from the API that owns the answer. It
+        # matters more than a cosmetic column: the receiver is always this
+        # client, and the receiver's free slots are the whole round budget.
+        local_capacity = -1
+        try:
+            local_capacity = int(GLOBAL_CACHE.Inventory.GetInventorySpace()[1])
+        except Exception as exc:
+            ConsoleLog(MODULE_NAME, "Local inventory space unreadable: %s" % exc, Console.MessageType.Warning, False)
+
         for account in GLOBAL_CACHE.ShMem.GetAllAccountData():
             key = str(account.AccountEmail or "")
             if not key:
                 continue
             map_id = int(account.AgentData.Map.MapID)
             is_local = key == local_email
+            state = InventoryTransfer.participant_from_shared_account(
+                account, explorable=_is_explorable(map_id, is_local)
+            )
+            if is_local and local_capacity >= 0:
+                state = replace(state, inventory=state.inventory.with_capacity(local_capacity))
             rows.append(
                 AccountRow(
                     key=key,
-                    state=InventoryTransfer.participant_from_shared_account(
-                        account, explorable=_is_explorable(map_id, is_local)
-                    ),
+                    state=state,
                     position=(float(account.AgentData.Pos.x), float(account.AgentData.Pos.y)),
                     map_id=map_id,
                     is_local=is_local,
+                    capacity_is_trusted=is_local and local_capacity >= 0,
                 )
             )
         return tuple(rows)
@@ -421,7 +440,7 @@ class InventoryTransferWidget:
 
         receiver_index = next((index for index, row in enumerate(rows) if row.key == self._receiver_key), -1)
 
-        if not PyImGui.begin_table("##inventory_transfer_participants", 8, TABLE_FLAGS):
+        if not PyImGui.begin_table("##inventory_transfer_participants", 9, TABLE_FLAGS):
             return
 
         PyImGui.table_setup_column("Recv")
@@ -430,7 +449,8 @@ class InventoryTransferWidget:
         PyImGui.table_setup_column("Account")
         PyImGui.table_setup_column("Map")
         PyImGui.table_setup_column("Party")
-        PyImGui.table_setup_column("Free")
+        PyImGui.table_setup_column("Items held")
+        PyImGui.table_setup_column("Free slots")
         PyImGui.table_setup_column("State")
         PyImGui.table_headers_row()
 
@@ -470,9 +490,15 @@ class InventoryTransferWidget:
             PyImGui.text(str(state.party_id))
 
             PyImGui.table_set_column_index(6)
-            PyImGui.text("%d / %d" % (state.inventory.free_slots, state.inventory.capacity))
+            PyImGui.text(str(state.inventory.used_slots))
 
             PyImGui.table_set_column_index(7)
+            if row.capacity_is_trusted:
+                PyImGui.text("%d of %d" % (state.inventory.free_slots, state.inventory.capacity))
+            else:
+                PyImGui.text_colored("not published", COLOR_MUTED)
+
+            PyImGui.table_set_column_index(8)
             if not state.alive:
                 PyImGui.text_colored("dead", COLOR_FAIL)
             elif state.in_aggro:
@@ -485,6 +511,13 @@ class InventoryTransferWidget:
                     PyImGui.text("%d eligible" % plannable)
 
         PyImGui.end_table()
+
+        PyImGui.text_colored(
+            "Free slots are read directly from this client's bags. Shared memory does not publish a "
+            "usable bag capacity for other accounts, so theirs are not shown -- and are not needed: "
+            "the receiver is always this client, and only its free slots set the round budget.",
+            COLOR_MUTED,
+        )
 
     def _draw_policy(self, cfg: Settings) -> None:
         PyImGui.text_colored("Wire policy: what the donors enforce", COLOR_TITLE)

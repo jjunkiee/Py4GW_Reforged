@@ -18,6 +18,13 @@ passing). Pyright reports zero errors on both files at the project
 configuration and at `strict`. No live-client verification has been run, and
 none of A1-A7 is confirmed.
 
+**Phase 4 found a live defect on first run:** the shared-memory bag `Size` is
+an item count, not a capacity (section 3.3). It was invisible to every offline
+check because the fixture encoded the same wrong assumption the reader did. The
+widget drew four accounts, one of them reported 5 free slots where the character
+plainly had 26, and the arithmetic fell out from there. That is the review gate
+earning its place in the plan.
+
 **Phase 4 landed:** `Widgets/Guild Wars/Items & Loot/InventoryTransfer.py`, a
 dry-run-only widget, plus the precheck vocabulary, the shared-account adapter
 and the policy-text parsers it needed in the phase 1 planner. It reads every
@@ -40,9 +47,10 @@ project configuration; the planner and the fixture are also clean at `strict`.
 The widget carries four `strict` diagnostics, all of them upstream typing gaps
 in `Py4GWCoreLib` (`Color.to_tuple_normalized`, `ConsoleLog`, `ImGui.Begin`) and
 none of them fixable from the widget. The offline fixture now runs 172 checks,
-all passing. The widget has never been drawn by an injected client, so its ImGui
-layout, its Settings binding and its shared-memory read are unverified in the
-only place that counts, and A1-A7 all remain unconfirmed.
+all passing -- 181 after the bag-`Size` regression tests were added. The widget
+has been drawn by an injected client with four accounts in one party, which is
+what exposed the `Size` defect; its Settings binding, its precheck output and
+its preview tables are still unverified, and A1-A7 all remain unconfirmed.
 
 **Phase 3 landed:** `TransferDropItems`, `TransferPickUpItems` and
 `TransferReport` appended to `SharedCommandType`, their handlers and dispatch
@@ -162,6 +170,34 @@ Two constraints come with it:
   snapshot can be up to 1.5 s stale. It is good enough to *plan* a round; it
   is never good enough to *commit* one. Each client re-checks locally before
   acting.
+- **`InventoryBagStruct.Size` is not a capacity.** *Verified on a live client,
+  2026-09-03, and the first defect the phase 4 review gate caught.* A character
+  holding 19 items across 45 slots published a total `Size` of 19. The publisher
+  (`AccountStruct._update_inventory_bags`) fills it from
+  `ItemArray.GetBag(bag_id).GetSize()`; `Inventory.GetInventorySpace` calls
+  `GetSize()` on a `PyInventory.Bag` it constructs directly and gets a real
+  capacity, so the two paths disagree and the shared-memory one is wrong. Note
+  also that `ItemArray.GetBag` returns `None` for a bag with no items, so a
+  completely empty bag contributes no capacity at all.
+
+  Two consequences, both handled in `snapshot_from_shared_bags`. Bounding the
+  slot read by `Size` silently *dropped items* that sat past the item count, so
+  the read now walks every published slot and treats a zero `ModelID` as the
+  only empty marker. And the capacity it reports is floored at the highest
+  occupied slot, so it can never claim less space than the bag demonstrably
+  holds.
+
+  This does not compromise the round budget, because of the answer to question 1
+  in section 11: the receiver is always the local client, and only the
+  receiver's free slots set the budget. The widget therefore corrects its own
+  row from `Inventory.GetInventorySpace()` through
+  `InventorySnapshot.with_capacity()` and does not report a free-slot count for
+  peers at all, rather than reporting a wrong one. A donor's capacity is never
+  used by the planner - only its item list is.
+
+  Fixing the publisher is the real repair and belongs to
+  `AccountStruct`/`ItemArray`, not to this feature. Filed here because anything
+  else reading `InventoryBags` is currently reading a wrong capacity too.
 
 Note: `TeamInventoryViewer.py` maintains a second, independent cross-account
 inventory snapshot through a shared `JsonFactory` document. Two parallel

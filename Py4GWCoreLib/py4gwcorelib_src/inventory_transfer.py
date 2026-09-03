@@ -250,6 +250,19 @@ class InventorySnapshot:
     def quantity_of(self, model_id: int) -> int:
         return sum(item.effective_quantity for item in self.items() if item.model_id == int(model_id))
 
+    def with_capacity(self, capacity: int) -> "InventorySnapshot":
+        """Copy with the total capacity replaced by an authoritative count.
+
+        The shared-memory publisher does not write a capacity this module can
+        trust (see :func:`snapshot_from_shared_bags`), so a client reading its
+        own bags should correct the snapshot rather than budget against a number
+        it knows is wrong. Per-bag structure collapses because nothing
+        downstream reads it -- item ordering rides on each record's own bag id,
+        not on the bag it is filed under here.
+        """
+        held = self.items()
+        return InventorySnapshot(bags=(BagSnapshot(bag_id=0, size=max(int(capacity), len(held)), items=held),))
+
     def without(self, keys: Iterable[tuple[int, int]]) -> "InventorySnapshot":
         """Copy with the named slots emptied. Used to advance a simulation."""
         removed = set(keys)
@@ -278,22 +291,32 @@ def snapshot_from_shared_bags(bags: Iterable[SharedBagLike]) -> InventorySnapsho
 
     Kept here rather than in the widget so there is one conversion, not one per
     consumer. The `Slots` array is fixed at `SHMEM_MAX_INVENTORY_BAG_SLOTS` and
-    zero-filled past the end, so `Size` bounds the read and a zero `ModelID`
-    marks an empty slot.
+    the publisher zero-fills it on every update, so a zero `ModelID` is the only
+    marker of an empty slot that this read needs.
+
+    **`Size` is not currently a trustworthy capacity.** The publisher fills it
+    from `ItemArray.GetBag(...).GetSize()`, and observed values match the bag's
+    item count rather than its capacity -- a 45-slot character holding 19 items
+    published a total `Size` of 19. Two consequences, both handled here rather
+    than papered over: this read no longer stops at `Size` (it would silently
+    drop any item sitting past the item count, losing it from the plan), and the
+    capacity it reports is floored at the highest occupied slot. A client that
+    can read its own bags should still correct the result through
+    :meth:`InventorySnapshot.with_capacity` instead of trusting this number.
 
     Everything the struct cannot express stays `None`, which is what makes the
     resulting records plannable but not droppable.
     """
     collected: list[BagSnapshot] = []
     for bag in bags:
-        size = int(bag.Size)
+        published_size = int(bag.Size)
+        highest_used = -1
         items: list[ItemRecord] = []
         for index, slot in enumerate(bag.Slots):
-            if index >= size:
-                break
             model_id = int(slot.ModelID)
             if model_id == 0:
                 continue
+            highest_used = index
             quantity = int(slot.Quantity)
             items.append(
                 ItemRecord(
@@ -306,6 +329,11 @@ def snapshot_from_shared_bags(bags: Iterable[SharedBagLike]) -> InventorySnapsho
                     stackable=True if quantity > 1 else None,
                 )
             )
+        # An item sitting at slot 7 proves the bag has at least 8 slots. That
+        # floor matters because `Size` cannot currently be trusted to be the
+        # bag's capacity, and a capacity below the contents would report negative
+        # free space as zero and quietly refuse every transfer.
+        size = max(published_size, highest_used + 1)
         collected.append(BagSnapshot(bag_id=int(bag.BagID), size=size, items=tuple(items)))
     return InventorySnapshot(bags=tuple(collected))
 
