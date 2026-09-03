@@ -1,11 +1,12 @@
 # Cross-Account Inventory Transfer (Drop-and-Collect Ferry)
 
-**Status:** Phases 1-3 of section 8 (planner, offline tests, yield helpers,
-enum, message handlers) are implemented; phases 4-6 are still proposed. The
-three commands now exist and can be driven by hand from the Messaging window's
-send-message section, but no widget composes them into a session, so a transfer
-is still a manual, one-round-at-a-time exercise with no precheck, no rally, no
-reconciliation, and no settle warning.
+**Status:** Phases 1-4 of section 8 (planner, offline tests, yield helpers,
+enum, message handlers, dry-run widget) are implemented; phases 5-6 are still
+proposed. A widget now composes the whole session and shows it -- participants,
+policy, precheck, per-round plan, the exact round 1 messages, leftovers and
+exclusions -- but it sends nothing. Actually moving an item is still a manual,
+one-round-at-a-time exercise driven by hand from the Messaging window's
+send-message section, with no rally, no reconciliation, and no settle warning.
 Every game-behavior claim marked *inferred* below remains unverified against a
 live injected client and must be confirmed before the corresponding code is
 trusted. The planner encodes those assumptions as constants and defaults to the
@@ -16,6 +17,32 @@ conservative branch, so it is arithmetically proven and behaviorally unproven.
 passing). Pyright reports zero errors on both files at the project
 configuration and at `strict`. No live-client verification has been run, and
 none of A1-A7 is confirmed.
+
+**Phase 4 landed:** `Widgets/Guild Wars/Items & Loot/InventoryTransfer.py`, a
+dry-run-only widget, plus the precheck vocabulary, the shared-account adapter
+and the policy-text parsers it needed in the phase 1 planner. It reads every
+account out of shared memory, lets the user pick one receiver and any number of
+donors, names a wire policy, and then shows what a live run would do: the seven
+prechecks reported one by one, the forecast rounds with per-item slot costs, the
+literal `TransferDropItems` and `TransferPickUpItems` payloads round 1 would
+carry, what stays in donor bags, and what policy excluded. There is no
+`SendMessage` call in the file; nothing crosses the wire.
+
+Two things the review gate exposed and the widget now says out loud. First, a
+drop message names a policy rather than carrying one, so coordinator-side
+protections and quantity floors change the preview's budget but are not what a
+donor enforces -- see open question 4. Second, the explorable check cannot be
+answered from a snapshot for a peer, only inferred from its map id, so it
+reports `unknown` rather than passing when the map is in neither enum table.
+
+Pyright reports zero errors on the planner, the fixture and the widget at the
+project configuration; the planner and the fixture are also clean at `strict`.
+The widget carries four `strict` diagnostics, all of them upstream typing gaps
+in `Py4GWCoreLib` (`Color.to_tuple_normalized`, `ConsoleLog`, `ImGui.Begin`) and
+none of them fixable from the widget. The offline fixture now runs 172 checks,
+all passing. The widget has never been drawn by an injected client, so its ImGui
+layout, its Settings binding and its shared-memory read are unverified in the
+only place that counts, and A1-A7 all remain unconfirmed.
 
 **Phase 3 landed:** `TransferDropItems`, `TransferPickUpItems` and
 `TransferReport` appended to `SharedCommandType`, their handlers and dispatch
@@ -283,6 +310,24 @@ PRECHECK -> SUSPEND -> RALLY -> [ ROUND: PLAN -> DROP -> COLLECT -> RECONCILE ]*
 6. No other transfer session is running - a module-level busy flag, following
    the `_merchant_busy` precedent at `Widgets/System/Messaging.py:53`.
 
+Phase 4 implemented these as `inventory_transfer.precheck_session`, which
+returns one named `PrecheckResult` per condition so the widget can show all of
+them rather than the first failure. Two refinements the implementation forced:
+
+- A seventh check came first, because the other six assume it: one receiver,
+  at least one donor, and the receiver not also listed as a donor.
+- Verdicts are three-valued, not boolean. `Map.IsExplorable()` answers only for
+  the local client; a peer's instance type is not in the snapshot, so the
+  widget infers it from the map id through the `explorables` / `outposts`
+  tables and reports `unknown` when the map is in neither. `precheck_passed`
+  treats `unknown` as a failure, so an unresolved check can never authorise a
+  session -- it just says which account it could not resolve.
+
+The isolation check is the one that almost never fires through the widget:
+`GetAllAccountData` already omits isolated peers, so an account the transport
+could not reach is usually not on screen to be selected. It stays as the second
+line of defence the plan intended.
+
 `SUSPEND`: coordinator sends `DisableHeroAI` to every participant, held for
 the whole session rather than per round. Per-round suspension has a real gap:
 between rounds a donor's `Looting` comes back on and it re-collects its own
@@ -427,6 +472,15 @@ Two refinements the implementation made to this table, both additive:
 
 `policy_name` resolves through `inventory_transfer.resolve_policy()`, which
 falls back to the conservative `default` policy for an unknown or empty name.
+The flip side, which phase 4 made concrete: a name is the *whole* contract. A
+coordinator can plan against a policy carrying protected models and quantity
+floors, but the donor rebuilds the policy from the name alone, so those fields
+never reach it. The dry-run widget therefore labels them preview-only, and
+question 4 in section 11 settles what phase 5 does about it: nothing. Only the
+three built-in names go on the wire, and the Run control says out loud that a
+donor will not honour anything else. The refusals that carry real risk --
+untradeable, customized, last ID kit, last salvage kit -- are already in
+`default` and are enforced by the donor's own live read.
 That fallback direction matters: a donor on an older build than the coordinator
 drops *fewer* items than budgeted, never more. Built-in names are `default`,
 `stackables` and `optimistic`; a widget passes user-defined policies through the
@@ -493,7 +547,7 @@ ground is clear, or the user explicitly dismisses, does the session send
 | `Py4GWCoreLib/py4gwcorelib_src/inventory_transfer.py` | **new** - pure planner: eligibility, `predict_slot_cost`, round decomposition, reconciliation. No `Py4GW` imports |
 | `Py4GWCoreLib/routines_src/yield_src/items.py` | add `Items.DropItems(item_ids)` and `Items.LootGroundItems(radius, max_items)`; the latter builds an unowned-item array and delegates to the existing `LootItems` |
 | `Widgets/System/Messaging.py` | add the three handlers and their `ProcessMessages()` cases |
-| `Widgets/Guild Wars/Items & Loot/InventoryTransfer.py` | **new** widget: account selection, receiver picker, policy editor, preview, run/abort/recall, progress |
+| `Widgets/Guild Wars/Items & Loot/InventoryTransfer.py` | **new** widget: account selection, receiver picker, policy editor, precheck, preview (phase 4, landed); run/abort/recall/progress still to come |
 | `Examples and tests/tests/test_inventory_transfer_planner.py` | **new** offline planner tests |
 | `docs/loot/plans/cross-account-inventory-transfer.md` | this document |
 | `docs/loot/plans/README.md` | index entry |
@@ -541,10 +595,35 @@ Each phase is independently reviewable and leaves the tree buildable.
    window's send-message section (`_MESSAGE_TYPE_OPTIONS` enumerates
    `SharedCommandType`), so the two-account hand-driven check needs no UI work.
    Still to do: run that check, in an explorable area, with a throwaway item.
-4. **Widget, dry-run only.** Account selection, preview of the computed plan,
-   no packets sent. This is the review gate: the plan must read correctly
-   before it is allowed to move anything.
-5. **Widget, live.** Run, abort, recall, progress, settle warnings.
+4. **Widget, dry-run only.** *Done.*
+   `Widgets/Guild Wars/Items & Loot/InventoryTransfer.py`. Account selection, a
+   receiver picker, a wire-policy chooser, the precheck reported check by check,
+   the forecast rounds, the literal round 1 payloads, the leftovers and the
+   policy exclusions -- and no packet sent. The review gate did its job before a
+   single item moved: it is what surfaced that a policy *name* is the whole
+   contract a donor honours (open question 4), and that a peer's explorable
+   state can only be inferred from its map id, which is why the precheck is
+   three-valued rather than boolean.
+   Three things landed in the phase 1 planner rather than the widget, because
+   they are pure and had to stay offline-testable: the precheck vocabulary with
+   its `ParticipantState` and `participant_from_shared_account` adapter, a
+   `can_communicate` mirror of the transport's private rule, and
+   `parse_model_list` / `parse_model_floors` for the policy text boxes.
+   `explain_exclusions` joined them as the coordinator's counterpart to
+   `explain_rejections`: the snapshot cannot see tradability, so listing what
+   `select_droppable` refused would report "tradability unknown" for nearly
+   every item and tell the user nothing.
+5. **Widget, live.** Run, abort, recall, progress, settle warnings. Shaped by
+   the four answers in section 11: the coordinator is the receiver, donors are
+   paused by default, leftovers warn without blocking, and only built-in policy
+   names go on the wire. The suspend gap in section 6.2 is answered by
+   re-sending `DisableHeroAI` at the head of each round rather than teaching
+   `HealStaleHeroAISnapshot` about owned sessions -- a round already carries a
+   HeroAI-suspending message, so the heal logic keeps working unchanged for
+   every other caller.
+   Blocked on live evidence, not on design: nothing in phases 2-4 has run
+   against an injected client, so A1-A7 are all unconfirmed and the hand-driven
+   protocol check in section 9 has never been performed.
 6. **Optional extras.** Gold transfer, `PauseWidgets` integration, chained
    receivers.
 
@@ -559,13 +638,50 @@ python "Examples and tests/tests/test_inventory_transfer_planner.py"
 Cases: empty donor; single non-stackable; full-stack move; partial-stack merge
 (optimistic on and off); dye non-merge; receiver at zero free slots; receiver
 at exactly one free slot with a 250 stack pending; protected model excluded;
-last-kit protection; multi-round decomposition; stall detection.
+last-kit protection; multi-round decomposition; stall detection. Phase 4 added:
+the shared-account adapter; the `can_communicate` mirror against every branch of
+the transport's rule; each precheck failing for its own reason and an unresolved
+check not counting as a pass; the coordinator's exclusion explainer listing only
+proven-ineligible items; and the policy text parsers, including the half-typed
+input that must not blank a list.
+
+The widget itself is not covered here, and cannot be: it imports `PyImGui` and
+`Py4GWCoreLib`, so it needs an injected client to load at all. That is the
+reason every pure decision it makes lives in the planner instead -- the widget
+is composition and drawing, and holds no arithmetic of its own.
 
 **Static:** the project's strict Pyright/Pylance check over every changed
 file. Typing failures are defects, per `AGENTS.md`. `Messaging.py` carries
 sixteen pre-existing errors at the project configuration; the bar for a change
 to it is that the count and the list are unchanged, checked against
 `git show HEAD:Widgets/System/Messaging.py`, not that the file is clean.
+
+The widget has a different bar than the planner, and it is worth stating so a
+later reader does not "fix" it. At the project configuration it is clean. At
+`strict` it reports four diagnostics, all of them the return or parameter types
+of `Py4GWCoreLib` surfaces it merely calls -- `Color.to_tuple_normalized`,
+`ConsoleLog`, `ImGui.Begin`. Those are upstream gaps shared by every widget in
+the tree; narrowing them belongs to those owners, not to a caller. Hoisting the
+five colour constants to module level already collapsed thirty-three of those
+call sites into one, which was worth doing for the per-frame work it saves as
+much as for the diagnostics.
+
+**Widget dry run (phase 4, no live risk):** enable
+`Inventory Transfer` in the widget manager with at least two accounts running.
+Nothing it does is observable in game, so this is safe to run anywhere.
+
+1. Every account publishing to shared memory appears in Participants, with its
+   map, party, free slots and state.
+2. Picking a receiver clears it from the donor list; selection and policy
+   survive a widget reload, through the widget's account-scoped `Settings`
+   document.
+3. In an outpost, the explorable check fails and names the accounts. In an
+   explorable area with everyone in one party, all seven checks pass.
+4. The round 1 message preview matches what section 6.5 specifies: one
+   `TransferDropItems` per donor carrying that donor's `max_items`, one
+   `TransferPickUpItems` to the receiver, `2N + 2` messages for the round.
+5. Nothing is sent. `grep -n SendMessage` over the widget returns only the
+   docstring line that says so.
 
 **Hand-driven protocol check (phase 3, two accounts, no widget):** send the
 messages from the Messaging window's send-message section. The commands appear
@@ -642,13 +758,45 @@ Deliberately rejected, with reasons:
 - **Per-item checkboxes across every account** - a large UI for what
   model-level protection lists already express.
 
-## 11. Open questions for the maintainer
+## 11. Questions for the maintainer
 
-1. Should the coordinator be pinned to the receiver's client, or may any
-   account drive a transfer between two others? The plan supports either; the
-   UI is simpler if pinned.
-2. Is `PauseWidgets` on donors acceptable as a default, or should it be
-   opt-in? It is the reliable way to keep `AutoInventoryHandler` from
-   salvaging an item that is queued to be dropped, but it is a broad hammer.
-3. Should the leftover-on-ground state block the widget from being disabled,
-   or only warn? Blocking is safer and more annoying.
+All four were answered on 2026-09-03, before phase 5 was written. The answers
+are binding on phase 5 and are recorded here because a decision that only ever
+lived in a conversation is a decision that gets relitigated.
+
+1. **Should the coordinator be pinned to the receiver's client?**
+   *Answered: pinned.* A session only runs where this client is the receiver,
+   and the rally point is wherever this character stands. The plan supported
+   either, but the free-floating coordinator bought a second set of states and
+   a second way for the rally point to be wrong, and paid for neither.
+2. **Is `PauseWidgets` on donors acceptable as a default?**
+   *Answered: default on, with a toggle.* It is a broad hammer, but what it
+   prevents is `AutoInventoryHandler` salvaging an item already queued to be
+   dropped. An interrupted widget is cheaper than a destroyed item.
+3. **Should leftovers on the ground block the widget from being disabled?**
+   *Answered: warn, never block.* Leftovers stop the session reporting success
+   and keep Recall live, but a user trying to escape a bad state must always be
+   able to. A widget that will not turn off is a worse failure than a pile that
+   needs collecting.
+4. **How should a user-defined policy reach the donors?**
+   *Answered: it does not, in phase 5.* Live runs name one of the three
+   built-in policies, which is the only thing a donor can resolve. The
+   protected-model and quantity-floor fields stay in the widget as forecasting
+   aids and the Run control says plainly that a donor will not honour them.
+
+   The reasoning, since this one looks like a hole and mostly is not: the
+   refusals that actually matter -- untradeable items, customized gear, the last
+   ID kit, the last salvage kit -- all live in `default` and are enforced by the
+   donor from its own live read, which is the only read that can see them. What
+   is missing is *user additions on top of those*. Building the distribution
+   channel in the same phase as the first live item movement would mean
+   debugging two new things at once the first time something ends up on the
+   ground, so it waits.
+
+   Still open, for a later phase: the shared `JsonFactory` document that
+   `TeamInventoryViewer` already uses for inventories is the most promising
+   carrier -- write the policy there, name it by hash in `ExtraData`, have the
+   donor read it back. The two rejected alternatives were registering user
+   policies per client through Settings (silently falls back to `default` on any
+   account that missed the memo) and moving the editor to the donor entirely
+   (correct about ownership, but per-account setup across eight boxes).

@@ -126,11 +126,20 @@ class SharedSlotLike(Protocol):
 
 
 class SharedBagLike(Protocol):
-    """Structural view of `shared_memory_src.InventoryBagStruct`."""
+    """Structural view of `shared_memory_src.InventoryBagStruct`.
+
+    `Slots` is a read-only property rather than an attribute so the real struct
+    matches: it declares `list[InventorySlotStruct]`, and a mutable protocol
+    attribute would demand that exact type instead of accepting any sequence of
+    something slot-shaped. Nothing here writes to a bag, so read-only is also
+    the honest declaration.
+    """
 
     BagID: int
     Size: int
-    Slots: Sequence[SharedSlotLike]
+
+    @property
+    def Slots(self) -> Sequence[SharedSlotLike]: ...
 
 
 @dataclass(frozen=True)
@@ -378,6 +387,53 @@ def resolve_policy(name: str, extra: dict[str, TransferPolicy] | None = None) ->
     return BUILTIN_POLICIES.get(key, BUILTIN_POLICIES[DEFAULT_POLICY_NAME])
 
 
+def parse_model_list(text: str) -> tuple[int, ...]:
+    """Read `"1234, 5678"` into model ids for `TransferPolicy.protected_models`.
+
+    Lives here rather than in the widget because it builds a policy field, and a
+    policy that has to mean the same thing on two clients cannot afford two
+    parsers. Anything that is not a positive integer is dropped rather than
+    raising: this reads a text box the user is still typing into, and a
+    half-finished entry must not blank the whole list.
+    """
+    models: list[int] = []
+    for chunk in str(text or "").replace(";", ",").split(","):
+        token = chunk.strip()
+        if not token:
+            continue
+        try:
+            model_id = int(token)
+        except ValueError:
+            continue
+        if model_id > 0 and model_id not in models:
+            models.append(model_id)
+    return tuple(models)
+
+
+def parse_model_floors(text: str) -> tuple[tuple[int, int], ...]:
+    """Read `"1234:5, 5678:10"` into `TransferPolicy.model_floors` pairs.
+
+    Same forgiving rule as :func:`parse_model_list`, and the first entry for a
+    model wins so a duplicated line cannot quietly loosen a floor.
+    """
+    floors: list[tuple[int, int]] = []
+    seen: set[int] = set()
+    for chunk in str(text or "").replace(";", ",").split(","):
+        token = chunk.strip()
+        if not token or ":" not in token:
+            continue
+        raw_model, _, raw_floor = token.partition(":")
+        try:
+            model_id = int(raw_model.strip())
+            floor = int(raw_floor.strip())
+        except ValueError:
+            continue
+        if model_id > 0 and floor > 0 and model_id not in seen:
+            seen.add(model_id)
+            floors.append((model_id, floor))
+    return tuple(floors)
+
+
 @dataclass(frozen=True)
 class DonorContext:
     """Donor-wide totals the per-item checks need.
@@ -535,6 +591,20 @@ def explain_rejections(
 ) -> tuple[tuple[ItemRecord, EligibilityResult], ...]:
     """Everything `select_droppable` refused, with the reason, for the UI."""
     return _select(items, policy, context, VERDICT_ALLOWED)[1]
+
+
+def explain_exclusions(
+    items: Iterable[ItemRecord], policy: TransferPolicy, context: DonorContext | None = None
+) -> tuple[tuple[ItemRecord, EligibilityResult], ...]:
+    """Everything `select_plannable` refused, with the reason, for the UI.
+
+    The coordinator's counterpart to :func:`explain_rejections`. Its snapshot
+    cannot see tradability, so nearly every item would appear in the droppable
+    rejections with "tradability unknown" -- true, and useless as a preview.
+    This lists only the items the coordinator can *prove* are ineligible, which
+    is what a preview should show as excluded.
+    """
+    return _select(items, policy, context, VERDICT_UNVERIFIED)[1]
 
 
 # --- Stack prediction ------------------------------------------------------
@@ -954,3 +1024,328 @@ STATUS_NAMES: dict[int, str] = {
 def status_name(status: int) -> str:
     """Human-readable form of a report status, for the UI and the console."""
     return STATUS_NAMES.get(int(status), "unknown status %d" % int(status))
+
+
+# --- Session precheck ------------------------------------------------------
+
+# Plan section 6.2. The coordinator has to answer "may this session run at all?"
+# before it computes a budget, and the answer has to be reported check by check
+# rather than as one silent boolean -- a user whose transfer refuses to start
+# deserves to know which of the conditions failed.
+#
+# Everything here reads the shared-memory snapshot, which is up to
+# SHMEM_PLAYER_INVENTORY_UPDATE_THROTTLE_MS stale (1.5 s). That is good enough
+# to refuse a session and never good enough to authorise one: each participant
+# re-checks its own state before acting, which is why the donor handler carries
+# its own explorable gate.
+
+CHECK_PASS = "pass"
+CHECK_FAIL = "fail"
+
+#: The snapshot cannot answer this one. Not a pass: a live session has to
+#: resolve it before it is allowed to send anything.
+CHECK_UNKNOWN = "unknown"
+
+CHECK_ROLES = "one receiver and at least one donor"
+CHECK_EXPLORABLE = "every participant is in an explorable area"
+CHECK_SAME_INSTANCE = "every participant shares one instance and party"
+CHECK_CAN_COMMUNICATE = "the coordinator can message every participant"
+CHECK_COMBAT_FREE = "nobody is in aggro and nobody is dead"
+CHECK_RECEIVER_SPACE = "the receiver has usable free slots"
+CHECK_SESSION_FREE = "no other transfer session is running"
+
+
+@dataclass(frozen=True)
+class PrecheckResult:
+    """One named precheck and how it came out."""
+
+    name: str
+    state: str
+    detail: str = ""
+
+    @property
+    def passed(self) -> bool:
+        return self.state == CHECK_PASS
+
+    @property
+    def failed(self) -> bool:
+        return self.state == CHECK_FAIL
+
+    @property
+    def unresolved(self) -> bool:
+        return self.state == CHECK_UNKNOWN
+
+
+@dataclass(frozen=True)
+class ParticipantState:
+    """One account as the coordinator's shared-memory snapshot sees it.
+
+    Flat rather than a view onto `AccountStruct`, because this module may not
+    import the client. :func:`participant_from_shared_account` is the one
+    adapter, so a widget builds these and never grows a second conversion.
+    """
+
+    key: str
+    name: str = ""
+
+    map_id: int = 0
+    region: int = 0
+    district: int = 0
+    language: int = 0
+    party_id: int = 0
+
+    isolation_group: int = 0
+    isolated: bool = False
+
+    in_aggro: bool = False
+
+    #: Fraction of maximum health, matching `HealthStruct.Current`. Zero is
+    #: dead, and is also what an unpopulated slot reads, so a session refuses
+    #: rather than guesses.
+    health: float = 1.0
+
+    #: `None` when the caller could not tell. The snapshot carries a map id and
+    #: no instance type, so only the local client can answer this for certain;
+    #: a coordinator infers it for peers from the map id and says so.
+    explorable: bool | None = None
+
+    inventory: InventorySnapshot = field(default_factory=InventorySnapshot)
+
+    @property
+    def label(self) -> str:
+        """What the UI should call this account."""
+        return self.name or self.key
+
+    @property
+    def instance_key(self) -> tuple[int, int, int, int, int]:
+        """The tuple two accounts must share to be in one explorable instance.
+
+        Map id, region, district and language pin the instance; the party id
+        pins the copy of it, because explorable instances are party-scoped.
+        Same predicate as `on_same_map_and_party` in `HeroAI/commands.py`.
+        """
+        return (self.map_id, self.region, self.district, self.language, self.party_id)
+
+    @property
+    def alive(self) -> bool:
+        return self.health > 0.0
+
+    def as_donor(self) -> DonorSnapshot:
+        """The planner's view of this account as a source of items."""
+        return DonorSnapshot(key=self.key, inventory=self.inventory)
+
+
+class SharedMapLike(Protocol):
+    """Structural view of `shared_memory_src.MapStruct`."""
+
+    MapID: int
+    Region: int
+    District: int
+    Language: int
+
+
+class SharedHealthLike(Protocol):
+    """Structural view of `shared_memory_src.HealthStruct`."""
+
+    Current: float
+
+
+class SharedAgentLike(Protocol):
+    """The parts of `shared_memory_src.AgentDataStruct` a precheck reads."""
+
+    CharacterName: str
+
+    @property
+    def Map(self) -> SharedMapLike: ...
+
+    @property
+    def Health(self) -> SharedHealthLike: ...
+
+
+class SharedPartyLike(Protocol):
+    """Structural view of `shared_memory_src.AgentPartyStruct`."""
+
+    PartyID: int
+
+
+class SharedBagsLike(Protocol):
+    """Structural view of `shared_memory_src.InventoryBagsStruct`."""
+
+    def iter_bags(self) -> Iterable[SharedBagLike]: ...
+
+
+class SharedAccountLike(Protocol):
+    """The parts of `shared_memory_src.AccountStruct` a precheck reads."""
+
+    AccountEmail: str
+    IsolationGroupID: int
+    IsIsolated: bool
+    InAggro: bool
+
+    @property
+    def AgentData(self) -> SharedAgentLike: ...
+
+    @property
+    def AgentPartyData(self) -> SharedPartyLike: ...
+
+    @property
+    def InventoryBags(self) -> SharedBagsLike: ...
+
+
+def participant_from_shared_account(account: SharedAccountLike, explorable: bool | None = None) -> ParticipantState:
+    """Adapt one `AccountStruct` into the flat state the precheck reads.
+
+    `explorable` stays a caller's answer on purpose: the struct carries a map id
+    and no instance type, and the map-id-to-instance-type table lives in the
+    client enums this module may not import.
+    """
+    return ParticipantState(
+        key=str(account.AccountEmail or ""),
+        name=str(account.AgentData.CharacterName or ""),
+        map_id=int(account.AgentData.Map.MapID),
+        region=int(account.AgentData.Map.Region),
+        district=int(account.AgentData.Map.District),
+        language=int(account.AgentData.Map.Language),
+        party_id=int(account.AgentPartyData.PartyID),
+        isolation_group=int(account.IsolationGroupID),
+        isolated=bool(account.IsIsolated),
+        in_aggro=bool(account.InAggro),
+        health=float(account.AgentData.Health.Current),
+        explorable=explorable,
+        inventory=snapshot_from_shared_bags(account.InventoryBags.iter_bags()),
+    )
+
+
+def can_communicate(sender: ParticipantState, receiver: ParticipantState) -> bool:
+    """Mirror of `AllAccounts._can_communicate`, for the precheck only.
+
+    The transport stays the authority; this copy exists so a preview can fail
+    early and legibly instead of watching a message vanish. It is deliberately
+    identical in shape to the owner: self always, party members always, then
+    isolation groups, then the ungrouped legacy rule. If the owner's rule
+    changes this one is wrong and the precheck lies, so keep the two together.
+    """
+    if sender.key == receiver.key:
+        return True
+    if sender.party_id > 0 and sender.party_id == receiver.party_id:
+        return True
+    if sender.isolation_group > 0 and receiver.isolation_group > 0:
+        return sender.isolation_group == receiver.isolation_group
+    if sender.isolation_group > 0 or receiver.isolation_group > 0:
+        return False
+    return not sender.isolated and not receiver.isolated
+
+
+def _name_list(participants: Iterable[ParticipantState]) -> str:
+    return ", ".join(participant.label for participant in participants)
+
+
+def _check_roles(receiver: ParticipantState, donors: Sequence[ParticipantState]) -> PrecheckResult:
+    if not receiver.key:
+        return PrecheckResult(CHECK_ROLES, CHECK_FAIL, "no receiver selected")
+    if not donors:
+        return PrecheckResult(CHECK_ROLES, CHECK_FAIL, "no donor selected")
+
+    if any(donor.key == receiver.key for donor in donors):
+        return PrecheckResult(CHECK_ROLES, CHECK_FAIL, "the receiver is also selected as a donor")
+
+    keys = [donor.key for donor in donors]
+    if len(set(keys)) != len(keys):
+        return PrecheckResult(CHECK_ROLES, CHECK_FAIL, "the same donor is selected twice")
+
+    return PrecheckResult(CHECK_ROLES, CHECK_PASS, "%d donor(s) -> %s" % (len(donors), receiver.label))
+
+
+def _check_explorable(participants: Sequence[ParticipantState]) -> PrecheckResult:
+    refused = [one for one in participants if one.explorable is False]
+    if refused:
+        return PrecheckResult(CHECK_EXPLORABLE, CHECK_FAIL, "not explorable: %s" % _name_list(refused))
+
+    unresolved = [one for one in participants if one.explorable is None]
+    if unresolved:
+        return PrecheckResult(CHECK_EXPLORABLE, CHECK_UNKNOWN, "cannot tell for: %s" % _name_list(unresolved))
+
+    return PrecheckResult(CHECK_EXPLORABLE, CHECK_PASS)
+
+
+def _check_same_instance(participants: Sequence[ParticipantState]) -> PrecheckResult:
+    if not participants:
+        return PrecheckResult(CHECK_SAME_INSTANCE, CHECK_FAIL, "nobody selected")
+
+    partyless = [one for one in participants if one.party_id == 0]
+    if partyless:
+        return PrecheckResult(CHECK_SAME_INSTANCE, CHECK_FAIL, "not in a party: %s" % _name_list(partyless))
+
+    expected = participants[0].instance_key
+    strays = [one for one in participants[1:] if one.instance_key != expected]
+    if strays:
+        return PrecheckResult(
+            CHECK_SAME_INSTANCE,
+            CHECK_FAIL,
+            "in a different instance or party: %s" % _name_list(strays),
+        )
+
+    return PrecheckResult(CHECK_SAME_INSTANCE, CHECK_PASS, "map %d, party %d" % (expected[0], expected[4]))
+
+
+def _check_can_communicate(coordinator: ParticipantState, participants: Sequence[ParticipantState]) -> PrecheckResult:
+    unreachable = [one for one in participants if not can_communicate(coordinator, one)]
+    if unreachable:
+        return PrecheckResult(CHECK_CAN_COMMUNICATE, CHECK_FAIL, "isolation blocks: %s" % _name_list(unreachable))
+    return PrecheckResult(CHECK_CAN_COMMUNICATE, CHECK_PASS)
+
+
+def _check_combat_free(participants: Sequence[ParticipantState]) -> PrecheckResult:
+    fighting = [one for one in participants if one.in_aggro]
+    if fighting:
+        return PrecheckResult(CHECK_COMBAT_FREE, CHECK_FAIL, "in aggro: %s" % _name_list(fighting))
+
+    dead = [one for one in participants if not one.alive]
+    if dead:
+        return PrecheckResult(CHECK_COMBAT_FREE, CHECK_FAIL, "dead or not reporting health: %s" % _name_list(dead))
+
+    return PrecheckResult(CHECK_COMBAT_FREE, CHECK_PASS)
+
+
+def _check_receiver_space(receiver: ParticipantState, policy: TransferPolicy) -> PrecheckResult:
+    free = receiver.inventory.free_slots
+    margin = max(int(policy.safety_margin), 0)
+    if free <= 0:
+        return PrecheckResult(CHECK_RECEIVER_SPACE, CHECK_FAIL, "%s has no free slots" % receiver.label)
+    if free - margin <= 0:
+        return PrecheckResult(
+            CHECK_RECEIVER_SPACE,
+            CHECK_FAIL,
+            "%s has %d free slot(s), all held back by the safety margin" % (receiver.label, free),
+        )
+    return PrecheckResult(CHECK_RECEIVER_SPACE, CHECK_PASS, "%d usable free slot(s)" % (free - margin))
+
+
+def precheck_session(
+    coordinator: ParticipantState,
+    receiver: ParticipantState,
+    donors: Sequence[ParticipantState],
+    policy: TransferPolicy,
+    session_busy: bool = False,
+) -> tuple[PrecheckResult, ...]:
+    """Rule on a whole session, one named check at a time, in plan-section order.
+
+    Every check is evaluated rather than short-circuited: a user fixing a
+    transfer wants the whole list, not the first thing that went wrong.
+    """
+    participants = (receiver, *donors)
+
+    return (
+        _check_roles(receiver, donors),
+        _check_explorable(participants),
+        _check_same_instance(participants),
+        _check_can_communicate(coordinator, participants),
+        _check_combat_free(participants),
+        _check_receiver_space(receiver, policy),
+        PrecheckResult(CHECK_SESSION_FREE, CHECK_FAIL if session_busy else CHECK_PASS),
+    )
+
+
+def precheck_passed(results: Iterable[PrecheckResult]) -> bool:
+    """True only when every check passed. An unresolved check is not a pass."""
+    return all(result.passed for result in results)
