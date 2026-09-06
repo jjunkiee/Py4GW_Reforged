@@ -325,6 +325,22 @@ precisely the kind of thing that costs an afternoon three months from now.
 Exit criteria: consumer tier removed; MVP gate passes; `build_graph.py` runs clean with zero
 broken in-repo imports in the retained tree.
 
+**Done, 2026-09-06, in `c586f15d`, and tagged `mvp-baseline`.** 1,171 files removed; the
+repository went from 1,701 modules / 660,017 loc to 747 / 281,368. `Sources/frenkeyLib` was
+retained deliberately - every severance edge pointed at it, so keeping it took the edges
+needing a cut from ten to zero, and identify, salvage and auto-inventory stayed working.
+`Widgets/` remains as an empty directory because `_scan_widget_folders()` raises without it.
+
+The MVP gate was then run on a live client and passed: the launchpad renders with the widget
+browser empty.
+
+The boot closure did not move: 288 modules / 134,644 loc before and after. This phase clears
+the room and nothing else, exactly as [the two truncations](#the-two-truncations) predicted.
+Four broken imports remain in the retained tree, all pre-existing: the dead `Widgets.Blessed`
+call at `INTERACT_src.py:156`, and two broken member imports inside `frenkeyLib/Drafts`. The
+offline test suite no longer exists; it was deleted with `Examples and tests/` by decision,
+so the live gate is now the only regression signal.
+
 ## Phase 4 - Refactor the naked core
 
 You now hold roughly 206k lines of `Py4GWCoreLib` with no consumers watching. **This is the

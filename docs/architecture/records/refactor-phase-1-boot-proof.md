@@ -270,7 +270,9 @@ under-measurement of the same tree.
 
 - Phase 2 needs re-planning around the corrected queue. Its ordering puts the facade last;
   the measurement puts it first, and worth ten times the next item.
-- The MVP gate has not been run. Nothing here proves the launchpad renders with widgets
-  absent - only what loads when they are present.
+- ~~The MVP gate has not been run.~~ **Run and passed on 2026-09-06**, after the consumer
+  tier was deleted in `c586f15d`: the launcher starts the client, the DLL injects, the host
+  bootstraps and the launchpad renders, with the widget browser empty. That is the gate
+  sentence satisfied exactly, and it is tagged `mvp-baseline`.
 - The 166 modules / 72,230 loc that remain after the facade is emptied have not been
   analysed. That is the next floor, and nobody has looked at what holds it up.
