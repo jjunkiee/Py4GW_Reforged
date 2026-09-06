@@ -116,6 +116,7 @@ class ImportGraph:
         self.static: dict[str, set[str]] = {}
         self.edge_lines: dict[tuple[str, str], int] = {}
         self.deferred_edges: int = 0
+        self._init_cache: dict[str, tuple[str, ...]] = {}
 
         cache: dict[str, set[int] | None] = {}
         edges: list[dict[str, Any]] = graph["edges"]
@@ -133,13 +134,45 @@ class ImportGraph:
             else:
                 self.deferred_edges += 1
 
+    def package_inits(self, module: str) -> tuple[str, ...]:
+        """The package ``__init__.py`` files Python loads in order to load *module*.
+
+        Importing ``a.b.c`` executes ``a/__init__.py`` and ``a/b/__init__.py`` before
+        ``a/b/c.py``. There is no import statement for that, so ``build_graph.py``
+        records no edge, and a closure built from edges alone misses both the
+        ``__init__`` files and everything they import in turn.
+
+        Confirmed against a live client: every module this rule adds was observed in
+        ``sys.modules`` and had been absent from the closure. See
+        ``../records/refactor-phase-1-boot-proof.md``.
+        """
+
+        cached = self._init_cache.get(module)
+        if cached is not None:
+            return cached
+        parts = module.split("/")[:-1]
+        found: list[str] = []
+        for depth in range(len(parts)):
+            candidate = "/".join(parts[: depth + 1]) + "/__init__.py"
+            if candidate != module and candidate in self.modules:
+                found.append(candidate)
+        result = tuple(found)
+        self._init_cache[module] = result
+        return result
+
     def closure(
         self,
         roots: tuple[str, ...],
         adjacency: dict[str, set[str]],
         skip: tuple[str, str] | None = None,
     ) -> set[str]:
-        """Transitive closure from *roots*, optionally severing one edge."""
+        """Transitive closure from *roots*, optionally severing one edge.
+
+        Follows recorded import edges and, for every module reached, the package
+        ``__init__`` files Python must execute to get to it. A cut that releases a
+        module therefore also releases its package ``__init__`` files, unless
+        something else in the closure still reaches into the same package.
+        """
 
         seen: set[str] = set()
         stack: list[str] = list(roots)
@@ -148,6 +181,9 @@ class ImportGraph:
             if module in seen:
                 continue
             seen.add(module)
+            for parent in self.package_inits(module):
+                if parent not in seen:
+                    stack.append(parent)
             for target in adjacency.get(module, ()):
                 if skip is not None and (module, target) == skip:
                     continue
@@ -179,6 +215,48 @@ class ImportGraph:
                     previous[nxt] = module
                     queue.append(nxt)
         return None
+
+
+def rank_source_cuts(
+    graph: ImportGraph, roots: tuple[str, ...], boot: set[str]
+) -> list[dict[str, Any]]:
+    """Rank modules by how much emptying *all* their module-level imports releases.
+
+    Single-edge ranking is blind to a module whose cost is spread thinly across many
+    edges. ``Py4GWCoreLib/__init__.py`` has 41 module-level imports; no one of them
+    releases much, while emptying it releases roughly half the boot closure. That is
+    what a facade looks like from the boot path, and ranking edges alone hides it
+    behind cuts worth a tenth as much.
+
+    This is not a proposal to delete those imports. It measures which owner is
+    carrying the startup cost, which is the question the demolition order needs
+    answered first.
+    """
+
+    ranked: list[dict[str, Any]] = []
+    for source in sorted(boot):
+        if source in roots:
+            continue  # emptying the entry point is deleting the program, not a cut
+        targets = graph.module_level.get(source)
+        if not targets:
+            continue
+        adjacency = dict(graph.module_level)
+        adjacency[source] = set()
+        released = boot - graph.closure(roots, adjacency)
+        if not released:
+            continue
+        ranked.append(
+            {
+                "source": source,
+                "module_level_imports": len(targets),
+                "modules_released": len(released),
+                "loc_released": graph.loc(released),
+            }
+        )
+    ranked.sort(
+        key=lambda c: (-int(c["modules_released"]), -int(c["loc_released"]), str(c["source"]))
+    )
+    return ranked
 
 
 def rank_cuts(graph: ImportGraph, roots: tuple[str, ...], boot: set[str]) -> list[dict[str, Any]]:
@@ -303,6 +381,7 @@ def build_report(
         "boot_closure_by_namespace": dict(sorted(by_namespace.items(), key=lambda kv: (-kv[1], kv[0]))),
         "boot_closure_modules": sorted(boot),
         "severance_edges": severance,
+        "top_source_cuts": rank_source_cuts(graph, roots, boot)[:top],
         "top_cuts": rank_cuts(graph, roots, boot)[:top],
     }
 
@@ -371,6 +450,18 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
             print("                              -> " + str(cut["target"]))
+        print("")
+        print("top owners (releasing all of a module's module-level imports):")
+        owners: list[dict[str, Any]] = report["top_source_cuts"]
+        for owner in owners:
+            print(
+                "  -{0:>4} mods  -{1:>7} loc   {2} ({3} imports)".format(
+                    owner["modules_released"],
+                    owner["loc_released"],
+                    owner["source"],
+                    owner["module_level_imports"],
+                )
+            )
     return 0
 
 

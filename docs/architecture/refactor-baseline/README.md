@@ -74,11 +74,19 @@ python docs/architecture/refactor-baseline/tools/boot_closure.py
 the refactor needs: **what the injected client actually loads when the DLL runs the widget
 host.** It re-parses each source file to separate module-level imports from the 1,141 that
 sit inside function bodies and never execute at load — a distinction `graph.json` does not
-record, and one that changes the startup surface from 477 modules to 272.
+record, and one that changes the startup surface from 487 modules to 288.
+
+It also follows the package `__init__` files Python executes on the way to a submodule.
+Those have no import statement, so `graph.json` records no edge for them, and a closure
+built from edges alone misses both them and whatever they import. A live client confirmed
+the corrected closure exactly; the uncorrected one missed 16 modules.
 
 It reports the boot closure, the *severance edges* (imports from a retained area into the
-consumer tier), and a ranking of which single import cut releases the most modules from the
-boot closure. Output is deterministic and printed by default; `--out` writes JSON. Like the
+consumer tier), and two rankings: which single import cut releases the most modules from the
+boot closure, and which *module* releases the most if all of its module-level imports go.
+The second exists because the first is blind to a facade - a module whose cost is spread
+across dozens of edges, none individually significant. In this repository they disagree by a
+factor of seven, and the second is the one Phase 2 works from. Output is deterministic and printed by default; `--out` writes JSON. Like the
 generator it passes strict Pyright with 0 errors and imports nothing from this repository.
 
 Its figures are consumed by [../plans/refactor-sequencing.md](../plans/refactor-sequencing.md).

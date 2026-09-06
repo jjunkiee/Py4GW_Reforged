@@ -1,14 +1,16 @@
 # Refactor Phase 1 Boot Proof
 
-Status: current procedure; result unresolved pending a live capture
+Status: current; runtime-verified on 2026-09-06
 Scope: the MVP gate sentence, and proving the static boot closure against a running client
 Authority: [refactor-sequencing.md](../plans/refactor-sequencing.md) schedules this work;
 `boot_capture_compare.py` produces the verdict; the live client is the only proof
 
 Phase 1 has two jobs. Settle the one sentence the whole plan hangs on, and find out
-whether the 272-module boot closure is true of a running client or only of the source.
-Until the second is answered, the Phase 2 cut ranking is a static claim, and Phase 2 is
-where the expensive work lives.
+whether the boot closure is true of a running client or only of the source.
+
+Both are done. The answer to the second was no, twice, for two different reasons - and
+correcting the second of them removed the plan's central demolition charge. See
+[Result](#result); the procedure below is kept because Phase 2 reruns it after every cut.
 
 ## The MVP gate
 
@@ -20,11 +22,9 @@ launch, injection, Python host, settings resolution, ImGui draw path. The boot p
 [`Py4GW_widget_manager.py`](../../../Py4GW_widget_manager.py), whose three module-level
 imports are `Settings`, `WidgetManager` and `launch_bar/launchpad`.
 
-**Whether `Widgets/System` is inside or outside the gate is deliberately not decided here.**
-The plan recommends excluding it, and records that as a judgement rather than a finding
-([Known Unknown 2](../plans/refactor-sequencing.md#known-unknowns)). The capture procedure
-below measures what that tier actually costs at startup, so the decision can be made
-against a number instead of an opinion. Deciding it first would waste the measurement.
+Whether `Widgets/System` is inside or outside the gate was left open until the capture
+could price it. It now has a number - 6 modules, 6,188 lines - and the reasoning is under
+[The `Widgets/System` question](#the-widgetssystem-question).
 
 ## Why this needs a live client at all
 
@@ -61,6 +61,10 @@ raising during enable would otherwise prevent `_bootstrap_once()` from ever runn
 and cost a whole game launch for nothing.
 
 ## Runbook
+
+**The probe is currently reverted.** To take another capture, first reinstall it with
+`git revert <the revert commit>`, which restores the probe as a fresh commit and keeps the
+history honest about when instrumentation was present.
 
 Do these in order. Every field is spelled out; nothing here relies on a setting being left
 over from a previous run.
@@ -140,20 +144,91 @@ unaffected. Regenerate normally once the probe is reverted.
 
 ### Step 6 - remove the probe
 
-Not yours to do. Once the capture is interpreted the probe is reverted, and the record
-below is completed with the result.
+Not yours to do. Once the capture is interpreted the probe is reverted and this record is
+completed with the result. `Py4GW_widget_manager.py` is the boot root the refactor exists to
+shrink; leaving 68 lines of instrumentation in it would corrupt the metric.
 
 ## Result
 
-**Unresolved. One capture taken on 2026-09-06; it invalidated itself and a second is
-required.** The verdict on the cut ranking is therefore still open.
+**Resolved on 2026-09-06. The boot closure now matches the live client exactly - after two
+corrections, one to the probe and one to the analyser. The cut ranking did not survive.**
 
-The comparison tool had been exercised against synthetic captures covering both outcomes,
-so the instrument's *logic* was sound. Its input was not.
+Final comparison, against the second capture:
 
-### What the first capture found, and what it broke
+| | Modules | Lines |
+|---|---|---|
+| Static boot closure | 288 | 134,644 |
+| Live, at the `import` stage | 288 | 134,644 |
+| Loaded but not predicted | 0 | - |
+| Predicted but not loaded | 0 | - |
 
-The probe recorded module *names* at each stage but the name-to-path map only once, at
+An exact match in both directions. The boot closure is now a runtime-confirmed measurement
+rather than a static claim, and [Known Unknown 1](../plans/refactor-sequencing.md#known-unknowns)
+is closed.
+
+### The finding: the facade gets there first
+
+The sequencing plan's demolition charge was
+`WidgetManager.py:17 -> Py4GWCoreLib.GlobalCache`, credited with releasing 180 modules and
+89,091 lines - "eighty-nine thousand lines to obtain a shared-memory handle". **Cutting it
+releases nothing.** Traced through the corrected closure:
+
+```
+Py4GW_widget_manager.py:18
+    imports Py4GWCoreLib.py4gwcorelib_src.Settings
+        which forces Python to execute Py4GWCoreLib/__init__.py
+            whose line 120 is  from .GlobalCache import GLOBAL_CACHE
+```
+
+All three of the host's module-level imports are `Py4GWCoreLib.*`. Importing *anything*
+inside that package executes `Py4GWCoreLib/__init__.py` first, and that file imports
+`GlobalCache` - constructing the singleton - regardless of what `WidgetManager` does. The
+`GlobalCache` cut was never load-bearing; it was shadowed by a path nobody had drawn.
+
+This closes [Known Unknown 3](../plans/refactor-sequencing.md#known-unknowns), and closes it
+harder than it was asked. The facade is not merely *possibly* load-bearing at runtime: it is
+**structurally unavoidable**. No import into `Py4GWCoreLib` can skip it.
+
+### The corrected work queue
+
+Emptying `Py4GWCoreLib/__init__.py` of its 41 module-level imports releases **122 modules
+and 62,414 lines** - taking the boot floor from 288/134,644 to 166/72,230. Nothing else is
+close:
+
+| Owner | Module-level imports | Releases |
+|---|---|---|
+| `Py4GWCoreLib/__init__.py` | 41 | 122 modules / 62,414 loc |
+| `Py4GWCoreLib/Routines.py` | 11 | 43 modules / 26,653 loc |
+| `Py4GWCoreLib/Botting.py` | 21 | 37 modules / 8,221 loc |
+| `Py4GWCoreLib/GlobalCache/SharedMemory.py` | 16 | 29 modules / 4,415 loc |
+| `Py4GWCoreLib/routines_src/BehaviourTrees.py` | 14 | 22 modules / 18,027 loc |
+
+The best *single edge* now releases 38 modules and 8,583 lines. That gap between the best
+edge and the best owner is the point: the facade's cost is spread across 41 imports, none
+of which looks significant alone, so an edge-ranked queue hides it behind cuts worth a
+fraction as much. `boot_closure.py` now reports both rankings for that reason.
+
+### The `Widgets/System` question
+
+Answered with a number, as intended. The widget tier costs 308 modules and 260,091 lines at
+startup, and `Widgets/System` is **6 modules and 6,188 lines** of it - 2.4% of the widget
+cost, 4.6% of the boot closure. The remaining 149 widgets are the captured account's own
+configuration, and they drag 153 further non-widget modules with them.
+
+So including `Widgets/System` in the MVP is close to free, and the plan's recommendation to
+exclude it should rest on its actual argument - that `Messaging.py` is a misfiled transport
+carried in a widget, and the register's verdict on it is `Split` - rather than on startup
+cost. [Known Unknown 2](../plans/refactor-sequencing.md#known-unknowns) is closed as a
+measurement; the sequencing judgement remains the plan's to make.
+
+### Two corrections were needed to get here
+
+Neither was a surprise about the client. Both were defects in the measuring apparatus, found
+because a live client disagreed with it - which is the entire reason this phase exists.
+
+#### Correction 1: the probe lost paths to a mutating `sys.modules`
+
+The first capture invalidated itself. The probe recorded module *names* at each stage but the name-to-path map only once, at
 write time. Several widgets call `Utils.ClearSubModules` during discovery, which deletes
 entries from `sys.modules`. Any module present at an earlier stage and removed before the
 write therefore lost its path, and the comparer - which resolves repository membership by
@@ -168,16 +243,12 @@ Fixed by recording `name -> __file__` at each stage, at the moment it is taken. 
 schema is now version 2, and schema 1 captures are rejected rather than reinterpreted,
 because a silently misread capture is worse than no capture.
 
-### What survives the defect
+A second capture was taken with the corrected probe. It is the one every figure above
+comes from.
 
-Two findings are unaffected, because the modules involved kept their paths throughout.
+#### Correction 2: the closure did not model implicit package initialisation
 
-**1. Discovery is where widget code runs.** 152 widget modules at `post_discover`, 0 at
-`import`, and `post_bootstrap` identical to `post_discover`. The stage table above was
-wrong on this point and has been corrected. `_apply_ini_configuration()` re-applies state
-to modules that are already loaded; the cost is paid inside `discover()`.
-
-**2. The graph does not model implicit package initialisation.** This one matters. Of the
+This is the one that changed the plan. Of the
 16 modules loaded at the import stage that the closure did not predict, 12 are package
 `__init__.py` files whose packages already have predicted children - Python loads a
 package's `__init__` when importing any submodule, and `build_graph.py` records no edge for
@@ -185,15 +256,21 @@ that. The remaining 4 are second-order: `launch_bar/model.py` and
 `system_settings/{controller,model,persistence}.py` are imported *by* those unmodelled
 `__init__.py` files.
 
-So the boot closure has a genuine blind spot, from a single systematic cause, and it
-under-predicts. Whether to teach the generators about package initialisation is a real
-decision - it changes `graph.json` and the recorded zero-point - and it is deliberately not
-taken here. It should be taken once a trustworthy capture exists, so both corrections can
-be applied and the ranking re-derived once rather than twice.
+The fix went into `boot_closure.py`, not `build_graph.py`. Nobody writes an import
+statement for a package `__init__`, so inventing graph edges would have inflated the
+register's fan-in and fan-out numbers for a relationship that exists in Python's semantics
+rather than in the source. `graph.json` is therefore unchanged and the component register
+is untouched; only the boot-closure metric moved, which is this plan's own metric.
+
+The boot closure went from 272 modules / 133,713 loc to **288 / 134,644**, and the recorded
+zero-point moves with it. That is the correct direction: the old number was an
+under-measurement of the same tree.
 
 ### Still open
 
-- A schema 2 capture. Rerun the runbook above from Step 2.
-- Whether the ranked cuts survive both corrections.
-- Whether `Widgets/System` belongs inside the MVP gate, which the widget bootstrap cost
-  answers once the capture is trustworthy.
+- Phase 2 needs re-planning around the corrected queue. Its ordering puts the facade last;
+  the measurement puts it first, and worth ten times the next item.
+- The MVP gate has not been run. Nothing here proves the launchpad renders with widgets
+  absent - only what loads when they are present.
+- The 166 modules / 72,230 loc that remain after the facade is emptied have not been
+  analysed. That is the next floor, and nobody has looked at what holds it up.
