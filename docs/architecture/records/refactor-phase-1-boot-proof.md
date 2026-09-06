@@ -53,8 +53,8 @@ It records `sys.modules` at three points, which are not interchangeable:
 | Stage | Taken | What it proves |
 |---|---|---|
 | `import` | after the host's module-level imports, before anything else runs | The only stage comparable to the static boot closure. A repository module here that the closure did not predict is the finding that matters. |
-| `post_discover` | after `WidgetHandler.discover()` | Discovery walks the filesystem and builds `Widget` objects without executing widget code, so this should add nothing. Anything it adds is a surprise. |
-| `post_bootstrap` | after `_apply_ini_configuration()` | That call enables saved-enabled widgets and force-enables the `Widgets/System` tier, executing each. The growth from `import` is the startup cost the MVP gate proposes to stop paying. |
+| `post_discover` | after `WidgetHandler.discover()` | Despite the name, this is where widget code executes. `_load_widget_module()` reads each widget's saved enabled state and calls `enable()`, which loads the module ([`WidgetManager.py:940`](../../../Py4GWCoreLib/py4gwcorelib_src/WidgetManager.py#L940)). Measured live: 152 widget modules here, 0 at `import`. |
+| `post_bootstrap` | after `_apply_ini_configuration()` | Re-applies saved state and force-enables the `Widgets/System` tier, but everything is already loaded, so it adds nothing to `sys.modules`. The growth from `import` is the startup cost the MVP gate proposes to stop paying. |
 
 The write happens in a `finally` block. `INI_KEY` is set before discovery, so a widget
 raising during enable would otherwise prevent `_bootstrap_once()` from ever running again
@@ -145,11 +145,55 @@ below is completed with the result.
 
 ## Result
 
-**Unresolved.** No live capture has been taken yet. Until one is, the 272-module boot
-closure and the entire Phase 2 cut ranking remain static claims, exactly as
-[the sequencing plan's Known Unknown 1](../plans/refactor-sequencing.md#known-unknowns)
-records.
+**Unresolved. One capture taken on 2026-09-06; it invalidated itself and a second is
+required.** The verdict on the cut ranking is therefore still open.
 
-The comparison tool was exercised against synthetic captures covering both outcomes before
-this procedure was written, so a surprising result here can be trusted to be a real finding
-about the client rather than a defect in the instrument.
+The comparison tool had been exercised against synthetic captures covering both outcomes,
+so the instrument's *logic* was sound. Its input was not.
+
+### What the first capture found, and what it broke
+
+The probe recorded module *names* at each stage but the name-to-path map only once, at
+write time. Several widgets call `Utils.ClearSubModules` during discovery, which deletes
+entries from `sys.modules`. Any module present at an earlier stage and removed before the
+write therefore lost its path, and the comparer - which resolves repository membership by
+path - counted it as external. 135 of the 526 import-stage entries had no path.
+
+That defect manufactured the entire `predicted but not loaded` column. All 19 rows were
+`system_settings` modules that **were** loaded at the import stage under names such as
+`Py4GWCoreLib.py4gwcorelib_src.system_settings.loot_filters`, and were cleared before the
+write. The live totals were understated for the same reason.
+
+Fixed by recording `name -> __file__` at each stage, at the moment it is taken. The capture
+schema is now version 2, and schema 1 captures are rejected rather than reinterpreted,
+because a silently misread capture is worse than no capture.
+
+### What survives the defect
+
+Two findings are unaffected, because the modules involved kept their paths throughout.
+
+**1. Discovery is where widget code runs.** 152 widget modules at `post_discover`, 0 at
+`import`, and `post_bootstrap` identical to `post_discover`. The stage table above was
+wrong on this point and has been corrected. `_apply_ini_configuration()` re-applies state
+to modules that are already loaded; the cost is paid inside `discover()`.
+
+**2. The graph does not model implicit package initialisation.** This one matters. Of the
+16 modules loaded at the import stage that the closure did not predict, 12 are package
+`__init__.py` files whose packages already have predicted children - Python loads a
+package's `__init__` when importing any submodule, and `build_graph.py` records no edge for
+that. The remaining 4 are second-order: `launch_bar/model.py` and
+`system_settings/{controller,model,persistence}.py` are imported *by* those unmodelled
+`__init__.py` files.
+
+So the boot closure has a genuine blind spot, from a single systematic cause, and it
+under-predicts. Whether to teach the generators about package initialisation is a real
+decision - it changes `graph.json` and the recorded zero-point - and it is deliberately not
+taken here. It should be taken once a trustworthy capture exists, so both corrections can
+be applied and the ranking re-derived once rather than twice.
+
+### Still open
+
+- A schema 2 capture. Rerun the runbook above from Step 2.
+- Whether the ranked cuts survive both corrections.
+- Whether `Widgets/System` belongs inside the MVP gate, which the widget bootstrap cost
+  answers once the capture is trustworthy.

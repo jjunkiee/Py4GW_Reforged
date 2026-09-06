@@ -18,19 +18,27 @@ The capture has three stages, and they are not interchangeable:
     the finding that matters.
 
 ``post_discover``
-    After ``WidgetHandler.discover()``. Discovery walks the filesystem and builds
-    ``Widget`` objects; it does not execute widget code. Repository modules
-    appearing here are unexpected.
+    After ``WidgetHandler.discover()``. Despite the name, discovery is where widget
+    code executes: ``_load_widget_module()`` reads each widget's saved enabled state
+    and calls ``enable()``, which loads the module. Measured live at 152 widget
+    modules here against 0 at ``import``.
 
 ``post_bootstrap``
-    After ``_apply_ini_configuration()``, which enables saved-enabled widgets and
-    force-enables the ``Widgets/System`` tier, executing each one. The growth from
-    ``import`` to here is the startup cost the MVP gate proposes to stop paying, and
-    it is measured rather than estimated.
+    After ``_apply_ini_configuration()``. It re-applies saved state and force-enables
+    the ``Widgets/System`` tier, but the modules are already loaded by then, so it
+    adds nothing to ``sys.modules``. The growth from ``import`` to here is the
+    startup cost the MVP gate proposes to stop paying, and it is measured rather
+    than estimated.
 
 Only modules resolving inside the repository are compared. Standard library,
 site-packages and native extension modules are counted and then set aside: they are
 real cost but not this refactor's subject.
+
+Each stage records ``name -> __file__`` at the moment it is taken, not names now and
+paths later. That ordering is load-bearing: several widgets call
+``Utils.ClearSubModules`` during discovery, which deletes ``sys.modules`` entries, so
+a path map built at write time silently loses modules that were present earlier.
+Captures from the superseded schema are rejected rather than reinterpreted.
 
 This tool consumes the other two generators' published output rather than importing
 them, so like them it imports nothing and runs outside the injected client::
@@ -124,29 +132,31 @@ def stage_modules(
 ) -> tuple[dict[str, set[str]], dict[str, int]]:
     """Per stage: the repository modules loaded, and how many entries were external."""
 
-    raw_stages: Any = capture.get("stages")
-    raw_files: Any = capture.get("module_files")
-    if not isinstance(raw_stages, dict) or not isinstance(raw_files, dict):
-        raise SystemExit("capture is missing its 'stages' or 'module_files' object")
-    all_stages = cast("dict[str, Any]", raw_stages)
-    all_files = cast("dict[str, Any]", raw_files)
+    if "module_files" in capture:
+        raise SystemExit(
+            "this capture is from the superseded schema 1 probe and cannot be trusted.\n"
+            "It stored module paths once at write time rather than per stage, so any module\n"
+            "removed from sys.modules in between - widgets call Utils.ClearSubModules during\n"
+            "discovery - lost its path and was miscounted as external. Retake the capture with\n"
+            "the current probe; the procedure is in\n"
+            "docs/architecture/records/refactor-phase-1-boot-proof.md"
+        )
 
-    files: dict[str, str] = {}
-    for name, path in all_files.items():
-        if isinstance(path, str):
-            files[str(name)] = path
+    raw_stages: Any = capture.get("stages")
+    if not isinstance(raw_stages, dict):
+        raise SystemExit("capture is missing its 'stages' object")
+    all_stages = cast("dict[str, Any]", raw_stages)
 
     in_repo: dict[str, set[str]] = {}
     external: dict[str, int] = {}
     for stage in STAGES:
-        names: Any = all_stages.get(stage)
-        if not isinstance(names, list):
+        entries: Any = all_stages.get(stage)
+        if not isinstance(entries, dict):
             continue
         keys: set[str] = set()
         outside = 0
-        for entry in cast("list[Any]", names):
-            path = files.get(str(entry))
-            key = repo_key(path, repo_root, index) if path is not None else None
+        for _name, path in cast("dict[str, Any]", entries).items():
+            key = repo_key(path, repo_root, index) if isinstance(path, str) else None
             if key is None:
                 outside += 1
             else:
