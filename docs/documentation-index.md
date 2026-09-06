@@ -13,8 +13,12 @@ runtime observation remain authoritative.
   indexed by topic and reason.
 - [Py4GW AI guidance](py4gw-ai/README.md): ApoBot instructions, skills, and
   agent-workflow context.
-- [Architecture](architecture/README.md): project model, decisions, and
-  Reforged migration records.
+- [Architecture](architecture/README.md): project model, decisions, Reforged
+  migration records, the
+  [refactor baseline](architecture/refactor-baseline/README.md) — the generated
+  dependency graph and per-component verdict register — and the
+  [refactor sequencing plan](architecture/plans/refactor-sequencing.md) built
+  on it.
 - [Automation](automation/README.md): bots, behavior trees, HeroAI, and builds.
 - [Bridge](bridge/README.md): shared memory, daemon, CLI, and MCP boundaries.
 - [Game-client research](game-client/research/README.md): Guild Wars runtime,
