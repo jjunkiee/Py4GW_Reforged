@@ -55,7 +55,7 @@ knowing before a second machine joins the work.
 All 18 files in `Examples and tests/tests/` were executed individually at
 `refactor-origin` with Python 3.14.7.
 
-**Result: 11 pass, 7 fail.**
+**Result as measured: 11 pass, 7 fail. After the Phase 0 repairs below: 16 pass, 2 fail.**
 
 This corrects the register, which recorded 13 pass and 5 fail. Two further
 failures reproduce at this commit; both are named below. The register and the
@@ -80,17 +80,47 @@ Failing (7):
 | `test_paragon_refrain_atomic_handlers.py` | `AttributeError: IsHeroicRefrainSelfReady` | harness | The test builds a synthetic skill group at `:155` (`type("SkillGroup", (), {})()`). Production gained the call at `Py4GWCoreLib/Builds/Paragon/P_W/Defensive Refrain.py:163` in `05b7576d`. The real method exists at `Py4GWCoreLib/Builds/Skills/paragon/Leadership.py:27`, so this is a stale fake, not a dead call. |
 | `test_recolor_outcomes.py` | one case failed | harness | An exact-dict assertion predates the `modifiers` and `upgrades` fields on `Py4GWCoreLib/py4gwcorelib_src/system_settings/loot_filter_factory/model.py:198`. Production emits two keys the test does not expect. The other 20 cases in the file pass. |
 
-Five of the seven are harness staleness, one pair is already slated for removal,
+Four of the seven are harness staleness, one pair is already slated for removal,
 and exactly one - `test_salvage_upgrade_dialog.py` - is reporting a live
 production defect.
 
+### What was done about them
+
+The plan requires this decision before Phase 2, so it was taken here rather than
+deferred.
+
+- **The four harness failures were repaired** (`8dda7186`). Two were the
+  `parents[2]` fix. `test_recolor_outcomes` gained the two missing keys. The
+  paragon fixture needed two repairs: a non-generator predicate for the
+  bootstrap gate, and derived ids for the 27 skills the contract references but
+  no test names, so the fixture stops going stale every time the contract gains
+  a skill.
+- **The production defect was fixed separately** (`5a528ab1`), by completing the
+  half-finished rename in `UIManagerExtensions.py`. This is a behaviour change:
+  a fallback that always raised now returns options. **It has offline proof
+  only** and still needs the salvage dialog exercised in an injected client.
+- **The `test_sqlite3` pair is deliberately left red.** Both need native modules
+  that do not exist offline, and both carry a `Remove` verdict. Phase 3 deletes
+  them. Fixing them would be work spent on condemned code.
+
+Two red tests remain, both known and both condemned. That is a baseline against
+which "did I break this?" has an answer.
+
+The repairs moved the graph, as expected and by exactly the accountable amount:
+boot closure 133,710 to 133,713 lines (the production fix, which is inside the
+boot closure via the module-level severance edge at
+`behaviourtrees_src/items.py:73`), consumer tier 441,163 to 441,205 (the same 3
+lines plus 39 in the test files). Module counts are unchanged at 272 and 1,076.
+
 ## Open at the end of Phase 0
 
-1. **Fix or accept the 7 failures.** The plan requires this decision before
-   Phase 2, because "did I break this?" is unanswerable in Phase 4 against a
-   suite that was already red. Not decided here.
-2. **User data snapshot.** `json/`, `Settings/` and `Py4GW.ini` are not copied
-   off-tree yet. This is the one hazard deletion genuinely creates and it is a
-   standing constraint of the plan. Not done here.
-3. **Live boot-closure confirmation.** Phase 1 work, not Phase 0. The 272-module
+1. **Live proof of the salvage fix.** `GetSalvageOptions()`'s fallback is
+   repaired against its offline test, and nothing more. How often the fallback
+   is reached in-game was already unresolved in the register.
+2. **Live boot-closure confirmation.** Phase 1 work, not Phase 0. The 272-module
    figure remains a static claim until a live `sys.modules` capture confirms it.
+
+Closed during Phase 0: the fix-or-accept decision on the failing tests, recorded
+above; and the user data snapshot, taken off-tree to
+`_py4gw_phase0_backup6-09-06` outside the repository, with source and backup
+file counts confirmed matching.

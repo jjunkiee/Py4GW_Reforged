@@ -154,13 +154,14 @@ You are about to destroy the tree these documents describe. Preserve the evidenc
    creates and it is covered under [Standing constraints](#standing-constraints).
 5. **Establish the waypoint.** Run both generators and commit `graph.json`. This is the
    zero-point every later measurement is read against.
-6. **Establish the test baseline.** Run the 18 offline tests and record which pass. The
-   Phase 0 executed all 18 at `refactor-origin` and found **11 passing and 7 failing** - two
-   more failures than the baseline recorded. All 7 are pre-existing and are now diagnosed and
-   attributed in
-   [refactor-phase-0-waypoint.md](../records/refactor-phase-0-waypoint.md). Decide
-   now whether to fix them or accept them, because "did I break this?" is unanswerable in
-   Phase 4 against a suite that was already red.
+6. **Establish the test baseline.** Run the 18 offline tests and record which pass, then
+   decide whether to fix the failures or accept them, because "did I break this?" is
+   unanswerable in Phase 4 against a suite that was already red. **Done:** all 18 ran at
+   `refactor-origin` giving **11 pass, 7 fail** - two more failures than the baseline
+   recorded. Four harness defects and one production defect were repaired and the two
+   condemned `test_sqlite3` files were left red on purpose, giving **16 pass, 2 fail** with
+   both failures known. Diagnosis and per-test attribution are in
+   [refactor-phase-0-waypoint.md](../records/refactor-phase-0-waypoint.md).
 
 Exit criteria: baseline committed, tag exists, user data copied off-tree, phase-0 boot-closure
 numbers recorded, offline pass/fail set recorded.
@@ -378,9 +379,11 @@ still apply.
 5. **Whether the offline harness is enough coverage to refactor 206k lines against.** It is 18
    files, of which Phase 0 executed all 18 at `refactor-origin`: **11 pass, 7 fail**. The 7
    failures are pre-existing and are diagnosed in
-   [refactor-phase-0-waypoint.md](../records/refactor-phase-0-waypoint.md) - five are harness
-   staleness, one pair is already slated for removal, and exactly one reports a live
-   production defect. Carrying them into Phase 2 means starting the refactor without a green
-   baseline, which should be fixed or explicitly accepted first.
+   [refactor-phase-0-waypoint.md](../records/refactor-phase-0-waypoint.md) - four were harness
+   staleness, one pair is already slated for removal, and exactly one reported a live
+   production defect. Phase 0 repaired the four and the production defect and deliberately
+   left the condemned pair red, so the suite now stands at **16 pass, 2 fail** with both
+   failures known. The offline harness being sufficient coverage for 206k lines remains
+   unproven regardless; this is why every phase exit requires a live gate.
    This plan relies on the live gate at every phase precisely because the offline suite is not
    sufficient on its own.
