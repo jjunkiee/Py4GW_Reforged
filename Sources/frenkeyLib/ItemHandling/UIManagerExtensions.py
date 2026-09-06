@@ -145,10 +145,13 @@ class UIManagerExtensions:
             if options:
                 return options
 
-        salvage_window_mod_one_id = Frame(FrameId.SalvageWindow.Options.Option1)
-        salvage_window_mod_two_id = Frame(FrameId.SalvageWindow.Options.Option2)
-        salvage_window_mod_three_id = Frame(FrameId.SalvageWindow.Options.Option3)
-        salvage_window_materials_id = Frame(FrameId.SalvageWindow.Options.Option4)
+        # Option order is the dialog's, not ours: 1/2/3 are prefix, suffix and
+        # inscription, 4 is materials. Same mapping as LootEx/ui_manager_extensions.py,
+        # which is where this fallback came from.
+        prefix_option = Frame(FrameId.SalvageWindow.Options.Option1)
+        suffix_option = Frame(FrameId.SalvageWindow.Options.Option2)
+        inscription_option = Frame(FrameId.SalvageWindow.Options.Option3)
+        materials_option = Frame(FrameId.SalvageWindow.Options.Option4)
 
         if prefix_option.exists:
             options[SalvageMode.Prefix] = prefix_option
