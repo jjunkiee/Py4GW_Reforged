@@ -71,12 +71,12 @@ Open a terminal at the repository root and run:
 
 ```
 git branch --show-current
-git log --oneline -1
-grep -c "TEMPORARY: Phase 1 probe" Py4GW_widget_manager.py
+grep -c "_write_boot_capture" Py4GW_widget_manager.py
 ```
 
-Expected: the branch is `refactor/truncation`, and the `grep` count is **4**. If the count
-is `0`, the probe has already been reverted and the capture cannot be taken.
+Expected: the branch is `refactor/truncation`, and the `grep` count is **2** - the probe's
+writer function and the one call to it. If the count is `0`, the probe has already been
+reverted and the capture cannot be taken.
 
 ### Step 2 - clear any stale capture
 
