@@ -155,7 +155,10 @@ You are about to destroy the tree these documents describe. Preserve the evidenc
 5. **Establish the waypoint.** Run both generators and commit `graph.json`. This is the
    zero-point every later measurement is read against.
 6. **Establish the test baseline.** Run the 18 offline tests and record which pass. The
-   baseline found 13 passing and 5 failing; those 5 are pre-existing and undiagnosed. Decide
+   Phase 0 executed all 18 at `refactor-origin` and found **11 passing and 7 failing** - two
+   more failures than the baseline recorded. All 7 are pre-existing and are now diagnosed and
+   attributed in
+   [refactor-phase-0-waypoint.md](../records/refactor-phase-0-waypoint.md). Decide
    now whether to fix them or accept them, because "did I break this?" is unanswerable in
    Phase 4 against a suite that was already red.
 
@@ -373,8 +376,11 @@ still apply.
    identify, salvage and auto-inventory when their functions run. How much of the MVP's useful
    behaviour that removes was not measured.
 5. **Whether the offline harness is enough coverage to refactor 206k lines against.** It is 18
-   files, of which the baseline executed all 18: **13 pass, 5 fail**. The 5 failures are
-   pre-existing and were not diagnosed here; carrying them into Phase 2 means starting the
-   refactor without a green baseline, which should be fixed or explicitly accepted first.
+   files, of which Phase 0 executed all 18 at `refactor-origin`: **11 pass, 7 fail**. The 7
+   failures are pre-existing and are diagnosed in
+   [refactor-phase-0-waypoint.md](../records/refactor-phase-0-waypoint.md) - five are harness
+   staleness, one pair is already slated for removal, and exactly one reports a live
+   production defect. Carrying them into Phase 2 means starting the refactor without a green
+   baseline, which should be fixed or explicitly accepted first.
    This plan relies on the live gate at every phase precisely because the offline suite is not
    sufficient on its own.

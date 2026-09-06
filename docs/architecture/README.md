@@ -6,8 +6,9 @@ when they conflict.
 
 - `reference/` contains the conceptual model and derived feature inventory.
 - `guides/` contains the traceable-refactor and migration review guide.
-- `records/` contains pending work, whiteboards, and the Reforged migration
-  record.
+- `records/` contains pending work, whiteboards, the Reforged migration
+  record, and the refactor Phase 0 waypoint - the measured zero-point the
+  refactor is read against.
 - `refactor-baseline/` contains the dependency-and-architecture baseline for the
   planned large-scale refactor: committed generators, the raw `graph.json`, the
   dependency map, and a per-component verdict register. It answers *what each
