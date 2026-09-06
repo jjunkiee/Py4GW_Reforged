@@ -17,5 +17,10 @@ implementations.
   for proving the static boot closure against a running client, plus the result
   once a capture has been taken. It is the only place the live-capture runbook
   lives; the probe it describes is temporary instrumentation, not shipped code.
+- `py4gwcorelib-facade-bootstrap.md` catalogues what `Py4GWCoreLib/__init__.py`
+  does at import time - `sys.path` mutation, `builtins` injection, a native
+  monkey-patch, the `sys.stdout` redirect - who depends on each, and why
+  repointing back-edges cannot lower the boot floor. Read it before changing
+  that file.
 - Current source, tests, and runtime evidence outrank any record here when they
   conflict with an observed implementation.

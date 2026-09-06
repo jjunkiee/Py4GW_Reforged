@@ -269,11 +269,26 @@ Then sever the two module-level severance edges at
 which are the only load-time imports from core into the consumer tier. These are PF-3's
 severance, scoped by the graph rather than by estimate.
 
-Finally, repoint the facade back-edges reachable from the host. The register's
-`Improve in place` verdict on `Py4GWCoreLib/__init__.py` is this same work. The baseline
-recommends rehearsing on cycles 4, 6 and 7 first - small `__init__` to submodule loops of
-identical shape - and that advice holds: they are cheap, they are real, and they teach the
-pattern before it is applied to a 323-module component.
+Repoint the facade back-edges reachable from the host. The register's `Improve in place`
+verdict on `Py4GWCoreLib/__init__.py` is this same work, and the baseline's advice to
+rehearse on cycles 4, 6 and 7 first - small `__init__` to submodule loops of identical shape
+- holds: they are cheap, they are real, and they teach the pattern before it is applied to a
+323-module component.
+
+**But do not schedule this as a startup fix.** Rewriting `from Py4GWCoreLib import X` into
+`from Py4GWCoreLib.foo import X` does not skip `Py4GWCoreLib/__init__.py` - Python executes
+a package's `__init__` before any submodule of it. Repointing every back-edge in the
+repository would move the boot closure by exactly zero. It is a cycle fix and an ownership
+fix, both worth having, and it is not this phase's lever.
+
+The lever is what `__init__.py` *itself* imports, and it cannot simply be emptied: that file
+is a runtime bootstrap that every import into the package depends on - `sys.path` and `PATH`
+mutation, five `builtins` injections carrying 3,375 unqualified `PySystem` call sites, a
+monkey-patch of `PyInventory.Bag.GetItems` that the core inventory cache relies on, and the
+`sys.stdout` redirect that owns all diagnostic output. Read
+[py4gwcorelib-facade-bootstrap.md](../records/py4gwcorelib-facade-bootstrap.md) before
+touching this file; it catalogues each side effect, who depends on it, and what a
+bootstrap-only version would cost.
 
 Regenerate both reports after **each** cut, not at the end of the phase. A cut that does not
 move the boot closure did not do what you thought.
