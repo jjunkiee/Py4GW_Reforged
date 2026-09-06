@@ -279,3 +279,11 @@ Py4GW_Reforged_Launcher/*.exe
 Py4GW_Reforged_Launcher/dev_notes/
 Py4GW.dll
 .claude/
+
+# Refactor Phase 1 measurement artifacts. boot-capture.json is written by a
+# temporary probe inside the injected client and is specific to one machine and
+# one widget configuration; boot-closure.json is regenerated on demand by
+# boot_closure.py --out. Neither is evidence worth committing -- the findings
+# they support live in docs/architecture/records/.
+boot-capture.json
+boot-closure.json

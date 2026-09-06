@@ -41,8 +41,10 @@ python docs/architecture/refactor-baseline/tools/boot_closure.py
 
 The first rewrites `graph.json`, the static import graph. The second reads it
 and reports the boot closure, the severance edges, and the ranked import cuts.
-Neither imports anything from this repository, so both run outside the injected
-client. Both pass Pyright in `strict` mode with zero errors.
+A third, `boot_capture_compare.py`, checks those static figures against a
+`sys.modules` capture taken inside a running client. None imports anything from
+this repository, so all three run outside the injected client, and all three
+pass Pyright in `strict` mode with zero errors.
 
 Regenerate both at every phase boundary. A plan whose numbers have not been
 refreshed against current source is a historical record wearing a proposal's

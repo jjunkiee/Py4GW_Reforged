@@ -21,6 +21,7 @@ component *is*, the register is the authority; the plan only decides *when*.
 | [component-register.md](component-register.md) | One row per component: owner, layer, fan-in, fan-out, external consumers, verdict, rationale, blast radius, confidence |
 | [tools/build_graph.py](tools/build_graph.py) | The committed generator |
 | [tools/boot_closure.py](tools/boot_closure.py) | Load-time analyser over `graph.json`: boot closure, severance edges, ranked import cuts |
+| [tools/boot_capture_compare.py](tools/boot_capture_compare.py) | Checks a live client's `sys.modules` capture against the static boot closure |
 | [graph.json](graph.json) | `build_graph.py`'s raw output — the spine everything else sits on |
 
 ## Method
@@ -81,7 +82,30 @@ boot closure. Output is deterministic and printed by default; `--out` writes JSO
 generator it passes strict Pyright with 0 errors and imports nothing from this repository.
 
 Its figures are consumed by [../plans/refactor-sequencing.md](../plans/refactor-sequencing.md).
-Both tools are meant to be rerun at every phase boundary of that plan.
+All three tools are meant to be rerun at every phase boundary of that plan.
+
+### Proving the boot closure against a live client
+
+```
+python docs/architecture/refactor-baseline/tools/boot_closure.py --out boot-closure.json
+python docs/architecture/refactor-baseline/tools/boot_capture_compare.py
+```
+
+`boot_closure.py` is honest about its own limit: it measures *static* reachability at load
+time and cannot see widget discovery, native callbacks, or `importlib` with a computed
+argument. `boot_capture_compare.py` settles that. It reads a `sys.modules` capture taken
+inside a running client and reports which repository modules loaded that the closure did
+not predict — the direction that would put the cut ranking on sand — alongside the reverse,
+and the cost of the widget tier that loads after bootstrap.
+
+Taking the capture needs a temporary probe in the widget host, because only the host knows
+when bootstrap has finished. The probe is not part of the shipped runtime; it is installed,
+run once, and reverted. The procedure and the current result are recorded in
+[../records/refactor-phase-1-boot-proof.md](../records/refactor-phase-1-boot-proof.md).
+
+Unlike the other two, this tool consumes their published output rather than importing them,
+so all three remain standalone. It passes strict Pyright with 0 errors and returns a
+non-zero exit code when the capture contradicts the closure, so it can gate a phase.
 
 ### What the generator records
 
