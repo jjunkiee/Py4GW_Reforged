@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+import re
 import unittest
 
 
@@ -35,6 +36,21 @@ SKILL_IDS = {
 }
 
 
+def _unnamed_skill_ids(source):
+    """Ids for every skill the contract references but no test names.
+
+    The bar under test equips a handful of skills; the contract reaches for
+    dozens. Without this, a handler dies with NameError on an unrelated branch
+    instead of exercising the branch under test - and the fixture goes stale
+    again the next time the contract gains a skill. These ids are deliberately
+    outside SKILL_IDS, so IsSkillEquipped answers False for all of them.
+    """
+    names = sorted(
+        {name for name in re.findall(r"\b([A-Za-z_]\w*)_ID\b", source) if name not in SKILL_IDS}
+    )
+    return {f"{name}_ID": index for index, name in enumerate(names, start=len(SKILL_IDS) + 1)}
+
+
 class _ChecksSkills:
     can_cast = True
 
@@ -66,6 +82,7 @@ def _load_contract_class():
         "BuildMgr": _BuildMgr,
         "Routines": _Routines,
         "SkillsTemplate": object,
+        **_unnamed_skill_ids(source),
         **{f"{name}_ID": skill_id for name, skill_id in SKILL_IDS.items()},
     }
     exec(compile(isolated, CONTRACT_PATH, "exec"), namespace)
@@ -151,10 +168,31 @@ class _SkillMethod:
         return values[0]
 
 
-def _skill_group(names, calls, outcomes):
+class _SkillPredicate:
+    """A state query rather than a cast.
+
+    It returns its value directly instead of as a generator, because production
+    calls it bare, and it stays out of ``calls`` because that ledger records
+    casts in order. Defaults to True so the gate is open unless a test closes it.
+    """
+
+    def __init__(self, name, outcomes):
+        self.name = name
+        self.outcomes = outcomes
+
+    def __call__(self, *args, **kwargs):
+        values = self.outcomes.get(self.name, [True])
+        if len(values) > 1:
+            return values.pop(0)
+        return values[0]
+
+
+def _skill_group(names, calls, outcomes, predicates=()):
     group = type("SkillGroup", (), {})()
     for name in names:
         setattr(group, name, _SkillMethod(name, calls, outcomes))
+    for name in predicates:
+        setattr(group, name, _SkillPredicate(name, outcomes))
     return group
 
 
@@ -165,6 +203,7 @@ def _skillbook(calls, outcomes):
         ("Heroic_Refrain", "Aggressive_Refrain", "Anthem_of_Flame", "Theyre_on_Fire"),
         calls,
         outcomes,
+        predicates=("IsHeroicRefrainSelfReady",),
     )
     root.Paragon.Motivation = _skill_group(
         (

@@ -209,7 +209,7 @@ check("an entry with no marks carries no mark keys after save",
        "item_types": [], "model_ids": [], "dye_colors": [], "salvages_into": [],
        "name_contains": [], "rarities": [], "max_requirement": None,
        "requirement_attribute": None, "min_value": None, "min_damage": None,
-       "damage_types": []},
+       "damage_types": [], "modifiers": [], "upgrades": []},
       stored[1])
 
 print("=" * 68)

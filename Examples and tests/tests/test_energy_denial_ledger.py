@@ -24,7 +24,7 @@ import sys
 from typing import Any
 
 MODULE_PATH = (
-    pathlib.Path(__file__).resolve().parent.parent / "Py4GWCoreLib" / "Builds" / "Skills" / "_energy_denial.py"
+    pathlib.Path(__file__).resolve().parents[2] / "Py4GWCoreLib" / "Builds" / "Skills" / "_energy_denial.py"
 )
 
 

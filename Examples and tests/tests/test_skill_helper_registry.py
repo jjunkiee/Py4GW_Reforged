@@ -22,7 +22,7 @@ import pathlib
 import sys
 from typing import Any, Callable
 
-MODULE_PATH = pathlib.Path(__file__).resolve().parent.parent / "Py4GWCoreLib" / "Builds" / "Skills" / "_registry.py"
+MODULE_PATH = pathlib.Path(__file__).resolve().parents[2] / "Py4GWCoreLib" / "Builds" / "Skills" / "_registry.py"
 
 
 def _load_registry_module() -> Any:
