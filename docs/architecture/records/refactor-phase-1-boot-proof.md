@@ -120,16 +120,23 @@ report that line verbatim - the probe logs its own failure rather than dying sil
 ### Step 5 - report back
 
 Tell me the file exists and I will run the comparison and interpret it. If you would rather
-run it yourself, it is:
+run it yourself, it is exactly these two commands:
 
 ```
-python docs/architecture/refactor-baseline/tools/build_graph.py
 python docs/architecture/refactor-baseline/tools/boot_closure.py --out boot-closure.json
 python docs/architecture/refactor-baseline/tools/boot_capture_compare.py
 ```
 
-The third command exits non-zero when the capture contradicts the closure, and prints one
-of two verdicts: `RANKING STANDS` or `RANKING AT RISK`.
+The second exits non-zero when the capture contradicts the closure, and prints one of two
+verdicts: `RANKING STANDS` or `RANKING AT RISK`.
+
+**Do not run `build_graph.py` while the probe is installed.** Every other phase boundary
+requires it, which is exactly why it is worth calling out here. The probe adds 68 lines to
+`Py4GW_widget_manager.py`, and that file is the boot root: regenerating would take the host
+from 87 lines to 155 in the committed zero-point, silently inflating the boot closure with
+instrumentation. The graph is already current as of the last commit before the probe, and
+`boot_closure.py` reads the committed graph rather than rescanning the tree, so it is
+unaffected. Regenerate normally once the probe is reverted.
 
 ### Step 6 - remove the probe
 
