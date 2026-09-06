@@ -38,15 +38,22 @@ MODULE_NAME = "Widget Manager"
 #                    every saved-enabled widget plus the forced System tier.
 #                    The difference from "import" is what the MVP gate proposes
 #                    to stop paying at startup.
-_BOOT_CAPTURE_STAGES: dict[str, list[str]] = {}
+# Each stage stores name -> __file__ (or None) captured *at that moment*. Storing
+# names now and resolving paths later loses any module removed in between, and
+# widgets remove plenty: several call Utils.ClearSubModules during discovery.
+_BOOT_CAPTURE_STAGES: dict[str, dict[str, str | None]] = {}
 _BOOT_CAPTURE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "boot-capture.json")
 
 
 def _capture_stage(label: str) -> None:
-    """Record the loaded-module names at *label*. Never raises."""
+    """Record the loaded modules and their files at *label*. Never raises."""
 
     try:
-        _BOOT_CAPTURE_STAGES[label] = sorted(sys.modules)
+        snapshot: dict[str, str | None] = {}
+        for name, module in list(sys.modules.items()):
+            path = getattr(module, "__file__", None)
+            snapshot[str(name)] = path if isinstance(path, str) else None
+        _BOOT_CAPTURE_STAGES[label] = snapshot
     except Exception:
         pass
 
@@ -57,20 +64,15 @@ def _write_boot_capture() -> None:
     try:
         import json
 
-        files: dict[str, str] = {}
-        for name, module in list(sys.modules.items()):
-            path = getattr(module, "__file__", None)
-            if isinstance(path, str):
-                files[name] = path
         payload = {
             "meta": {
                 "probe": "Py4GW_widget_manager.py Phase 1 boot-closure probe",
+                "schema": 2,
                 "python": sys.version,
                 "cwd": os.getcwd(),
                 "host_file": os.path.abspath(__file__),
             },
             "stages": _BOOT_CAPTURE_STAGES,
-            "module_files": files,
         }
         with open(_BOOT_CAPTURE_PATH, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2, sort_keys=True)
