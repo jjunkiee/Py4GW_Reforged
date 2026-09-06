@@ -1,0 +1,5 @@
+# Widget discovery requires this directory to exist.
+# WidgetManager._scan_widget_folders() raises FileNotFoundError without it,
+# and _bootstrap_once() will not retry, because INI_KEY is already set.
+# Empty is the intended state for the trimmed core: discovery finds nothing
+# and succeeds, which is what the MVP gate asks for.

@@ -1,6 +1,0 @@
-[2026-07-30 20:30:50] [print:] [Inventory Slot Tint Test] using captured hovered item id=12177
-[2026-07-30 20:30:58] [print:] [Inventory Slot Tint Test] queued native tint item=12177 bag=1 slot=17 item=12177 frame=482 argb=0x8CFF00FF
-[2026-07-30 20:31:05] [print:] [Inventory Slot Tint Test] native paint diagnostics={'hook_installed': True, 'enabled': True, 'paint_calls': 85, 'tint_matches': 0, 'model_hits': 85, 'color_calls': 0, 'last_frame_id': 528, 'last_item_id': 3654, 'last_model': 1358792048}
-[2026-07-30 20:31:11] [print:] [Inventory Slot Tint Test] using captured hovered item id=21665
-[2026-07-30 20:31:12] [print:] [Inventory Slot Tint Test] queued native tint item=21665 bag=1 slot=12 item=21665 frame=477 argb=0x8CFF00FF
-[2026-07-30 20:31:14] [print:] [Inventory Slot Tint Test] native paint diagnostics={'hook_installed': True, 'enabled': True, 'paint_calls': 85, 'tint_matches': 0, 'model_hits': 85, 'color_calls': 0, 'last_frame_id': 528, 'last_item_id': 3654, 'last_model': 1358792048}

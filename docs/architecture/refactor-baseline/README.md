@@ -15,6 +15,15 @@ component *is*, the register is the authority; the plan only decides *when*.
 
 ## Contents
 
+> **The consumer tier has been deleted.** `component-register.md` and
+> `dependency-map.md` describe the repository as it stood at tag
+> `refactor-origin`, before `Widgets/`, `Bots/`, `Examples and tests/` and most of
+> `Sources/` were removed. They are preserved deliberately and are **not** being
+> updated to match the trimmed tree - after the deletion they cannot be
+> regenerated, because most of what they describe no longer exists. Read them as
+> a record of the starting point. `graph.json` **is** regenerated and describes
+> the current tree.
+
 | File | What it holds |
 |---|---|
 | [dependency-map.md](dependency-map.md) | Layer stack, runtime boundaries, per-layer Mermaid graphs, fan-in/fan-out tables, cycles, orphans, data coupling |
