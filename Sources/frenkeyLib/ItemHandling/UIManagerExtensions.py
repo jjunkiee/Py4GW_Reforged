@@ -150,18 +150,18 @@ class UIManagerExtensions:
         salvage_window_mod_three_id = Frame(FrameId.SalvageWindow.Options.Option3)
         salvage_window_materials_id = Frame(FrameId.SalvageWindow.Options.Option4)
 
-        if prefix_option.exists:
-            options[SalvageMode.Prefix] = prefix_option
+        if salvage_window_mod_one_id.exists:
+            options[SalvageMode.Prefix] = salvage_window_mod_one_id
 
-        if suffix_option.exists:
-            options[SalvageMode.Suffix] = suffix_option
+        if salvage_window_mod_two_id.exists:
+            options[SalvageMode.Suffix] = salvage_window_mod_two_id
 
-        if inscription_option.exists:
-            options[SalvageMode.Inscription] = inscription_option
+        if salvage_window_mod_three_id.exists:
+            options[SalvageMode.Inscription] = salvage_window_mod_three_id
 
-        if materials_option.exists:
-            options[SalvageMode.LesserCraftingMaterials] = materials_option
-            options[SalvageMode.RareCraftingMaterials] = materials_option
+        if salvage_window_materials_id.exists:
+            options[SalvageMode.LesserCraftingMaterials] = salvage_window_materials_id
+            options[SalvageMode.RareCraftingMaterials] = salvage_window_materials_id
 
         return options
     
