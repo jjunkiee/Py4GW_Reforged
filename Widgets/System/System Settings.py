@@ -41,15 +41,26 @@ _controller = get_controller()
 _inventory_controller = None
 _identification_controller = None
 _salvage_controller = None
+_ui_scale_controller = None
 _applied = False
 
 
 def draw() -> None:
     global _applied, _inventory_controller, _identification_controller, _salvage_controller
+    global _ui_scale_controller
     try:
         if not _applied:
             # Register the persisted options with the native side once (idempotent thereafter).
             _controller.apply_all_to_native()
+            # Overlay scale: cache the controller once so the per-frame reconcile
+            # below is a method call rather than a repeated import.
+            try:
+                from Py4GWCoreLib.py4gwcorelib_src.system_settings.ui_scale import get_controller as _ui_scale_get
+
+                _ui_scale_controller = _ui_scale_get()
+            except Exception as ui_scale_error:
+                PySystem.Console.Log(MODULE_NAME, "Overlay scale boot failed: %s" % ui_scale_error,
+                                     PySystem.Console.MessageType.Error)
             # Skillbar+ is a retired widget. Its complete runtime is booted here as a native,
             # profiled callback so no Guild Wars widget script is needed anymore.
             try:
@@ -163,6 +174,13 @@ def draw() -> None:
             except Exception:
                 pass
             _applied = True
+        # Every frame, not once at boot: a D3D9 device reset (alt-tab, resolution
+        # change) re-runs the native ImGui initialisation and restores the default
+        # style, which would silently drop the scale back to 1.0. Costs a float
+        # compare when unchanged, and it must run on the render thread - which
+        # draw() is, and update() is not.
+        if _ui_scale_controller is not None:
+            _ui_scale_controller.apply()
         # Renders the options window only while it is toggled open (via the launchpad cog).
         _controller.draw()
     except Exception as e:

@@ -224,6 +224,20 @@ def build_window(controller) -> "ImGui.SidebarWindow":
                                 (lambda e=_err: PyImGui.text_colored("Failed to build: %s" % e, ERR_COLOR)))
             continue
         if cat.key == "system":
+            # First in the category on purpose: this is the section you go looking
+            # for when the overlay is too small to read comfortably.
+            try:
+                from Py4GWCoreLib.py4gwcorelib_src.system_settings.ui_scale import config_ui as ui_scale_ui
+
+                ui_scale_ui.add_sections(win, group)
+            except Exception as exc:
+                import traceback
+
+                _log("System / Overlay Scale section failed to build: %r" % exc)
+                _log(traceback.format_exc())
+                _err = str(exc)
+                win.add_section(group, "Overlay Scale",
+                                (lambda e=_err: PyImGui.text_colored("Failed to build: %s" % e, ERR_COLOR)))
             try:
                 from Py4GWCoreLib.py4gwcorelib_src.system_settings.window_renamer import config_ui as renamer_ui
 
