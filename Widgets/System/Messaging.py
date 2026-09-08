@@ -723,10 +723,53 @@ def SnapshotHeroAIOptions(account_email: str):
     global hero_ai_snapshots
     if not account_email:
         return
+    data = _capture_hero_ai_options(account_email)
+    if data is None:
+        return
+
+    hero_ai_snapshots.setdefault(account_email, []).append(data)
+
+
+
+
+def RestoreHeroAISnapshot(account_email: str) -> bool:
+    """Pop one snapshot and put those options back. False when there was nothing to restore.
+
+    Exactly one restore per SnapshotHeroAIOptions. An empty stack means this caller never suspended
+    anything, so it must leave the options alone: forcing all five on would overwrite whatever the
+    user set and, because Looting is one of them, re-arm the very sender that got us here.
+    Callers that genuinely mean "turn HeroAI back on" ask for that explicitly on a False return.
+    """
+    global hero_ai_snapshots
+    if not account_email:
+        return False
+    account_snapshots = hero_ai_snapshots.get(account_email, [])
+    
+    if not account_snapshots:
+        return False
+
     hero_ai_options = GLOBAL_CACHE.ShMem.GetHeroAIOptionsFromEmail(account_email)
     if hero_ai_options is None:
-        return
-    
+        return False
+
+    last_state = account_snapshots.pop()
+    if not account_snapshots:
+        hero_ai_snapshots.pop(account_email, None)
+
+    return _apply_hero_ai_options(account_email, last_state)
+
+
+def _capture_hero_ai_options(account_email: str) -> HeroAIoptions | None:
+    """A detached copy of one account's HeroAI options, or None if unreadable.
+
+    The copy matters: the object GetHeroAIOptionsFromEmail returns is a live view onto
+    shared memory, so keeping a reference would "remember" whatever was written to it
+    next. Callers that hold state across frames need this, not the view.
+    """
+    hero_ai_options = GLOBAL_CACHE.ShMem.GetHeroAIOptionsFromEmail(account_email)
+    if hero_ai_options is None:
+        return None
+
     data: HeroAIoptions = HeroAIoptions()
     data.Following = hero_ai_options.Following
     data.Avoidance = hero_ai_options.Avoidance
@@ -735,37 +778,27 @@ def SnapshotHeroAIOptions(account_email: str):
     data.Combat = hero_ai_options.Combat
     for skill_index in range(SHMEM_MAX_NUMBER_OF_SKILLS):
         data.Skills[skill_index] = bool(hero_ai_options.Skills[skill_index])
-
-    hero_ai_snapshots.setdefault(account_email, []).append(data)
-
+    return data
 
 
-def RestoreHeroAISnapshot(account_email: str):
-    global hero_ai_snapshots
-    if not account_email:
-        return
-    account_snapshots = hero_ai_snapshots.get(account_email, [])
-    
-    if not account_snapshots:
-        EnableHeroAIOptions(account_email)  # If no snapshot, just enable everything to be safe
-        ConsoleLog(MODULE_NAME, "No Hero AI snapshot found, enabling all options as fallback.", Console.MessageType.Warning, True)
-        return
-    
+def _apply_hero_ai_options(account_email: str, saved: HeroAIoptions) -> bool:
+    """Write a captured copy back over an account's live options.
+
+    Looks the live view up itself rather than taking one, so callers never have to
+    name the shared-memory type.
+    """
     hero_ai_options = GLOBAL_CACHE.ShMem.GetHeroAIOptionsFromEmail(account_email)
     if hero_ai_options is None:
-        return
-    
-    last_state = account_snapshots.pop()
-    if not account_snapshots:
-        hero_ai_snapshots.pop(account_email, None)
+        return False
 
-    hero_ai_options.Following = last_state.Following
-    hero_ai_options.Avoidance = last_state.Avoidance
-    hero_ai_options.Looting = last_state.Looting
-    hero_ai_options.Targeting = last_state.Targeting
-    hero_ai_options.Combat = last_state.Combat
+    hero_ai_options.Following = saved.Following
+    hero_ai_options.Avoidance = saved.Avoidance
+    hero_ai_options.Looting = saved.Looting
+    hero_ai_options.Targeting = saved.Targeting
+    hero_ai_options.Combat = saved.Combat
     for skill_index in range(SHMEM_MAX_NUMBER_OF_SKILLS):
-        hero_ai_options.Skills[skill_index] = bool(last_state.Skills[skill_index])
+        hero_ai_options.Skills[skill_index] = bool(saved.Skills[skill_index])
+    return True
 
 
 _HERO_AI_SUSPENDING_COMMANDS = {
@@ -2280,8 +2313,10 @@ def MessageEnableHeroAI(index: int, message: SharedMessageStruct):
     account_email = message.ReceiverEmail
     if message.Params[0]:
         EnableHeroAIOptions(account_email)
-    else:
-        RestoreHeroAISnapshot(account_email)
+    elif not RestoreHeroAISnapshot(account_email):
+        # An explicit "enable HeroAI" must not be a no-op just because no suspend was outstanding.
+        # This is the only place that fallback belongs -- somebody asked for it.
+        EnableHeroAIOptions(account_email)
     GLOBAL_CACHE.ShMem.MarkMessageAsFinished(account_email, index)
     ConsoleLog(MODULE_NAME, "EnableHeroAI message processed and finished.", Console.MessageType.Info, False)
     yield
