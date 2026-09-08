@@ -91,6 +91,20 @@ class SharedCommandType(IntEnum):
     AccountSettingsSyncResult = auto()
     #endregion
 
+    # Cross-account inventory transfer (drop-and-collect ferry).
+    # IMPORTANT: append only; persisted/shared enum values must never shift.
+    TransferDropItems = auto()
+    TransferPickUpItems = auto()
+    TransferReport = auto()
+
+    # Session-scoped HeroAI suspension for the ferry. Separate from DisableHeroAI
+    # because that one finishes immediately and is therefore unwound by
+    # HealStaleHeroAISnapshot; a transfer needs the suspension to outlive the
+    # messages that do the work, on every account in the instance.
+    # IMPORTANT: append only; persisted/shared enum values must never shift.
+    TransferHoldHeroAI = auto()
+    TransferReleaseHeroAI = auto()
+
 class ReloadType(IntEnum):
     Unknown = auto()
     Buying = auto()

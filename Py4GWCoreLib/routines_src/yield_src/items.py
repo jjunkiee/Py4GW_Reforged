@@ -7,7 +7,7 @@ from ...GlobalCache.WhiteboardLocks import clear_loot_lock, post_loot_lock
 from ...Player import Player
 from ...GlobalCache import GLOBAL_CACHE
 from ...Py4GWcorelib import ConsoleLog, Console, ActionQueueManager
-from ...enums import SharedCommandType
+from ...enums import Range, SharedCommandType
 from ..BehaviourTrees import BT
 from .helpers import _run_bt_tree, wait
 from .movement import Movement
@@ -477,8 +477,14 @@ class Items:
                 return False
             if Agent.IsValid(item_id):
                 yield from YieldPlayer.InteractAgent(item_id)
-                while True:
+                # Bounded on purpose. An interact that never lands -- a full inventory
+                # is the ordinary case -- used to spin here forever, so this generator
+                # never returned, the caller's finally never ran, and anything it had
+                # suspended (HeroAI, a busy flag) stayed suspended until a reload.
+                waited_ms = 0
+                while waited_ms < pickup_timeout:
                     yield from wait(50)
+                    waited_ms += 50
                     live_items = AgentArray.GetItemArray()
                     if item_id not in live_items:
                         break
@@ -499,7 +505,16 @@ class Items:
         pickup_timeout: int = 5000,
         max_attempts: int = 5,
         attempts_timeout_seconds: int = 3,
+        stop_on_failure: bool = False,
     ):
+        """Collect the given item agents, retrying each one before giving up on it.
+
+        Returns the ids it could not take. `stop_on_failure` ends the whole run at the
+        first item that will not come: for a pile at one point that is the right call,
+        because the cause is a full inventory rather than a bad item and every further
+        attempt costs `max_attempts * attempts_timeout_seconds` for a foregone result.
+        A farming route wants the default, which skips the item and carries on.
+        """
         from ...AgentArray import AgentArray
         from ..Checks import Checks
 
@@ -572,6 +587,12 @@ class Items:
                 if not picked_up:
                     ConsoleLog("Loot", f"Failed to pick up item {item_id} after {max_attempts} attempts.")
                     failed_items.append(item_id)
+                    if stop_on_failure:
+                        if claimed_item_id:
+                            clear_loot_lock(claimed_item_id)
+                        ActionQueueManager().ResetAllQueues()
+                        Items._finish_active_pick_up_loot_message()
+                        return failed_items + item_array
             if claimed_item_id:
                 clear_loot_lock(claimed_item_id)
 
@@ -587,6 +608,241 @@ class Items:
 
         Items._finish_active_pick_up_loot_message()
         return failed_items
+
+    @staticmethod
+    def _wait_for_drop(
+        item_id: int,
+        expected_quantity: int,
+        timeout_ms: int = 2500,
+        poll_ms: int = 50,
+    ) -> Generator[Any, Any, bool]:
+        """Wait until a dropped stack has left the bags.
+
+        PyInventory actions are queued and return None, so the only evidence a drop
+        landed is the item disappearing from the inventory -- or, when the stack grew
+        between the quantity read and the drop, merely shrinking.
+        """
+        waited_ms = 0
+        while waited_ms < timeout_ms:
+            yield from wait(poll_ms)
+            waited_ms += poll_ms
+            if not item_still_present(item_id):
+                return True
+            if item_quantity(item_id) < expected_quantity:
+                return True
+        return False
+
+    @staticmethod
+    def DropItems(
+        item_ids: list[int],
+        log: bool = False,
+        progress_callback: Optional[Callable[[float], None]] = None,
+        drop_timeout: int = 2500,
+        poll_ms: int = 50,
+        explorable_only: bool = True,
+        max_units_per_item: int = 1,
+    ) -> Generator[Any, Any, list[int]]:
+        """Drop the given inventory items where the character stands.
+
+        This is the movement primitive; the caller owns selection and eligibility, the
+        same way LootItems owns no opinion about what it picks up. Each drop is
+        confirmed by polling before the next one is queued.
+
+        **A stack costs one call per unit.** Verified live 2026-09-03: both
+        `PyInventory.Inventory.DropItem` and `PyItem.drop_item_by_id` ignore the
+        quantity argument and move a single item, because `GW::item::DropItem` in
+        `Py4GW_Reforged_Native` never carries the quantity into the packet. So this
+        drains a stack by calling the drop repeatedly, and `max_units_per_item` bounds
+        how many calls one inventory slot is allowed to be worth. The quantity is
+        still passed on every call, so the loop simply finishes on the first pass the
+        day the binding is fixed.
+
+        `max_units_per_item` defaults to 1, which means "unstacked items only": a
+        larger stack is skipped **whole and untouched**. Refusing before the first
+        call rather than stopping partway is the point of the bound -- a half-dropped
+        stack is the worst outcome available here, splitting the items across the
+        donor's bags and the floor, so this never starts a stack it is not allowed to
+        finish.
+
+        Returns the ids observed leaving the bags entirely. An item that only shrank is
+        not in that list: the caller budgeted a whole slot and the remainder is still
+        in the bags, so reporting it as moved would be a lie. A failed drop does not
+        stop the run: the remaining items may still be droppable.
+        """
+        from ..Checks import Checks
+
+        dropped: list[int] = []
+        total_items = len(item_ids)
+        if total_items == 0:
+            return dropped
+
+        if not Checks.Map.MapValid():
+            return dropped
+
+        if explorable_only and not Checks.Map.IsExplorable():
+            ConsoleLog("DropItems", "Not in an explorable area, dropping nothing.", Console.MessageType.Warning)
+            return dropped
+
+        unit_budget = max(int(max_units_per_item), 1)
+
+        for index, item_id in enumerate(item_ids):
+            if item_id == 0:
+                continue
+
+            if not Checks.Map.MapValid():
+                ActionQueueManager().ResetAllQueues()
+                ConsoleLog("DropItems", "Map became invalid, stopping.", Console.MessageType.Warning)
+                return dropped
+
+            quantity = item_quantity(item_id)
+            if quantity <= 0:
+                if log:
+                    ConsoleLog("DropItems", f"Item {item_id} is no longer in the bags, skipping.", Console.MessageType.Warning)
+                continue
+
+            if quantity > unit_budget:
+                # Refused before the first call, not abandoned partway. One call moves
+                # one unit, so starting this stack would leave the remainder behind and
+                # the rest of it on the floor.
+                ConsoleLog(
+                    "DropItems",
+                    f"Item {item_id} is a stack of {quantity}, over the {unit_budget}-unit limit; leaving it alone.",
+                    Console.MessageType.Info,
+                )
+                if progress_callback:
+                    progress_callback((index + 1) / total_items)
+                continue
+
+            # One pass per unit. The loop re-reads the live quantity each time rather
+            # than counting down from the first read, so a stack that changed under us
+            # is still handled by what is actually in the bag.
+            for _attempt in range(unit_budget):
+                if not item_still_present(item_id):
+                    break
+
+                if not Checks.Map.MapValid():
+                    ActionQueueManager().ResetAllQueues()
+                    ConsoleLog("DropItems", "Map became invalid, stopping.", Console.MessageType.Warning)
+                    return dropped
+
+                remaining = item_quantity(item_id)
+                GLOBAL_CACHE.Inventory.DropItem(item_id, remaining)
+                a_unit_left = yield from Items._wait_for_drop(item_id, remaining, drop_timeout, poll_ms)
+
+                if not a_unit_left:
+                    # Nothing moved within the timeout. Trying again would most likely
+                    # spend the whole budget doing nothing, so stop on this item and let
+                    # the rest of the list run.
+                    ConsoleLog(
+                        "DropItems",
+                        f"Item {item_id} did not leave the bags within {drop_timeout} ms.",
+                        Console.MessageType.Warning,
+                    )
+                    break
+
+            if item_still_present(item_id):
+                ConsoleLog(
+                    "DropItems",
+                    f"Item {item_id} dropped partially, {item_quantity(item_id)} still in the bags.",
+                    Console.MessageType.Warning,
+                )
+            else:
+                dropped.append(item_id)
+
+            if progress_callback:
+                progress_callback((index + 1) / total_items)
+
+        if log:
+            ConsoleLog("DropItems", f"Dropped {len(dropped)} of {total_items} items.", Console.MessageType.Info)
+        return dropped
+
+    @staticmethod
+    def GetGroundItemIds(
+        radius: float = Range.Earshot.value,
+        center: Optional[tuple[float, float]] = None,
+        include_reserved: bool = True,
+        max_items: int = 0,
+    ) -> list[int]:
+        """Ground item agents around a point that this character may take, nearest first.
+
+        Unowned items, plus items still reserved for this character when
+        include_reserved -- which is what recalling one's own drop needs. center
+        defaults to the player position; max_items <= 0 means no cap.
+
+        Separate from LootGroundItems because "what is on the floor that I could take"
+        is also the question a caller asks *before* and *after* collecting, to count
+        what a round left behind. Three copies of this predicate would be three chances
+        for the count to disagree with the collection.
+        """
+        from ...AgentArray import AgentArray
+
+        rally_point = Player.GetXY() if center is None else center
+        own_agent_id = Player.GetAgentID()
+
+        def is_collectable(agent_id: int) -> bool:
+            owner_id = Agent.GetItemAgentOwnerID(agent_id)
+            if owner_id == 0:
+                return True
+            return include_reserved and owner_id == own_agent_id
+
+        item_array: list[int] = AgentArray.GetItemArray()
+        item_array = AgentArray.Filter.ByDistance(item_array, rally_point, radius)
+        item_array = AgentArray.Filter.ByCondition(item_array, is_collectable)
+        item_array = AgentArray.Sort.ByDistance(item_array, rally_point)
+        if max_items > 0:
+            item_array = item_array[:max_items]
+        return item_array
+
+    @staticmethod
+    def LootGroundItems(
+        radius: float = Range.Earshot.value,
+        max_items: int = 0,
+        center: Optional[tuple[float, float]] = None,
+        include_reserved: bool = True,
+        log: bool = False,
+        progress_callback: Optional[Callable[[float], None]] = None,
+        pickup_timeout: int = 5000,
+        max_attempts: int = 2,
+        attempts_timeout_seconds: int = 3,
+    ) -> Generator[Any, Any, bool]:
+        """Collect free ground items around a point, nearest first.
+
+        Takes the candidate array from GetGroundItemIds and hands it to LootItems,
+        which owns the loot locks, the movement, and the free-slot bail-out.
+        center defaults to the player position; max_items <= 0 means no cap.
+        """
+        rally_point = Player.GetXY() if center is None else center
+        item_array = Items.GetGroundItemIds(
+            radius=radius,
+            center=rally_point,
+            include_reserved=include_reserved,
+            max_items=max_items,
+        )
+
+        if log:
+            ConsoleLog(
+                "LootGroundItems",
+                f"Collecting {len(item_array)} ground item(s) within {int(radius)} of the rally point.",
+                Console.MessageType.Info,
+            )
+
+        # LootItemsWithMaxAttempts rather than LootItems: it gives up on an item it
+        # cannot take and returns the ones it failed, which is what a transfer round
+        # has to report. LootItems answers True either way.
+        # Everything here is one pile the character is already standing on, so the
+        # first refusal ends the run: the receiver is full, and the next seven items
+        # would each burn the same retry budget to learn the same thing. That wait is
+        # time the caller spends holding HeroAI suspended.
+        failed = yield from Items.LootItemsWithMaxAttempts(
+            item_array,
+            log=log,
+            progress_callback=progress_callback,
+            pickup_timeout=pickup_timeout,
+            max_attempts=max_attempts,
+            attempts_timeout_seconds=attempts_timeout_seconds,
+            stop_on_failure=True,
+        )
+        return not failed
 
     @staticmethod
     def WithdrawItems(model_id:int, quantity:int) -> Generator[Any, Any, bool]:

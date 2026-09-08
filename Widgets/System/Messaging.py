@@ -8,12 +8,13 @@ import Py4GW
 import ctypes
 
 from Py4GWCoreLib.HeroAI.cache_data import CacheData
-from Py4GWCoreLib import GLOBAL_CACHE, Player, Map, Agent, Effects, Inventory, Party
+from Py4GWCoreLib import GLOBAL_CACHE, Player, Map, Agent, AgentArray, Effects, Inventory, Party
 from Py4GWCoreLib import ActionQueueManager
 from Py4GWCoreLib import CombatPrepSkillsType
 from Py4GWCoreLib import Console
 from Py4GWCoreLib import ConsoleLog
 from Py4GWCoreLib.py4gwcorelib_src.system_settings.loot_filters import LootFilters
+from Py4GWCoreLib.py4gwcorelib_src import inventory_transfer as InventoryTransfer
 import PyImGui
 import PySystem
 from Py4GWCoreLib import Range, TitleID
@@ -816,6 +817,12 @@ _HERO_AI_SUSPENDING_COMMANDS = {
     SharedCommandType.UseSkill,
     SharedCommandType.DisableHeroAI,
     SharedCommandType.UseSkillCombatPrep,
+    SharedCommandType.TransferDropItems,
+    SharedCommandType.TransferPickUpItems,
+    # TransferHoldHeroAI is deliberately absent. It never pushes onto
+    # `hero_ai_snapshots` -- it keeps its own captured copy, swept by
+    # `_tick_hero_ai_holds` -- so there is nothing here for heal to drain and nothing to
+    # protect it from. Listing it would imply a relationship that does not exist.
 }
 
 
@@ -3557,6 +3564,596 @@ def AccountSettingsSyncResult(index: int, message: SharedMessageStruct) -> None:
 # endregion
 
 
+# region Cross-account inventory transfer
+
+# Drop-and-collect ferry, phase 3 of `docs/loot/plans/cross-account-inventory-transfer.md`.
+#
+# The coordinator owns the budget, the participant owns the selection: a drop command
+# carries a count budget plus a policy name and never an item manifest, because
+# SharedMessageStruct offers four floats and four 63-character strings and an item list
+# fits in neither. The donor resolves the item ids from its own live bag read, which is
+# also the only read that can see tradability -- the coordinator's shared-memory snapshot
+# carries model ids and quantities and nothing else.
+
+# One transfer step at a time per client. ProcessMessages() dispatches a fresh coroutine
+# every frame, so two overlapping sessions would otherwise have two coroutines dropping
+# and walking at once. A refused step reports STATUS_BUSY instead of queueing: the
+# coordinator can simply try again next round.
+_transfer_busy: bool = False
+
+# A donor already standing on the pile should not walk a lap to prove it.
+_TRANSFER_RALLY_TOLERANCE = 150.0
+_TRANSFER_RALLY_TIMEOUT_MS = 20000
+
+
+# Round reports are written here and read by the InventoryTransfer widget, which is a
+# different file that cannot import this one -- widgets are not a package. The store
+# therefore lives in the planner module both sides already import, rather than as an
+# undeclared `setattr` on GLOBAL_CACHE with two readers. It survives a widget reload for
+# the same reason GLOBAL_CACHE does: `Py4GWCoreLib` is loaded once for the process.
+#
+# These names stay as aliases because the plan's hand-driven protocol check calls them.
+TransferReportEntry = InventoryTransfer.TransferReportEntry
+get_transfer_reports = InventoryTransfer.get_transfer_reports
+clear_transfer_reports = InventoryTransfer.clear_transfer_reports
+
+
+def _send_transfer_report(
+    coordinator_email: str,
+    reporter_email: str,
+    session_id: str,
+    round_id: int,
+    items_moved: int,
+    slots_used: int,
+    status: int,
+) -> None:
+    """Answer the coordinator with what this participant actually did.
+
+    The round id in Params[0] is what defeats SendMessage's dedup: two rounds that moved
+    the same count would otherwise collapse into one slot and the second report would
+    never arrive. Sent from each handler's `finally`, so a round that died still answers.
+    """
+    if not coordinator_email or not reporter_email:
+        return
+
+    GLOBAL_CACHE.ShMem.SendMessage(
+        reporter_email,
+        coordinator_email,
+        SharedCommandType.TransferReport,
+        (float(round_id), float(items_moved), float(slots_used), float(status)),
+        (str(session_id or ""), reporter_email, "", ""),
+    )
+
+
+def _read_local_transfer_items() -> list[InventoryTransfer.ItemRecord]:
+    """Read bags 1-4 into planner records, in the order both sides walk them.
+
+    Same bag and slot order as the shared-memory publisher in
+    `AccountStruct._update_inventory_bags`, so a donor's own selection lines up with the
+    coordinator's projection. Every tri-state flag is filled in here because this is the
+    live read: an unfilled flag leaves the item merely plannable and never droppable,
+    which is the planner's whole point.
+    """
+    records: list[InventoryTransfer.ItemRecord] = []
+
+    for bag_id in InventoryTransfer.INVENTORY_BAG_IDS:
+        bag = GLOBAL_CACHE.ItemArray.GetBag(bag_id)
+        if bag is None:
+            continue
+
+        try:
+            items = bag.GetItems()
+        except Exception as exc:
+            ConsoleLog(MODULE_NAME, f"[Transfer] Could not read bag {bag_id}: {exc}", Console.MessageType.Warning, log=True)
+            continue
+
+        for item in items:
+            item_id = int(getattr(item, "item_id", 0) or 0)
+            # Not `or -1`: slot 0 is the first slot of a real bag, so the falsy-zero
+            # idiom silently dropped the first item of every bag from the donor list.
+            raw_slot = getattr(item, "slot", None)
+            slot = -1 if raw_slot is None else int(raw_slot)
+            if item_id == 0 or slot < 0:
+                continue
+
+            model_id = int(getattr(item, "model_id", 0) or 0) or int(GLOBAL_CACHE.Item.GetModelID(item_id))
+            quantity = int(getattr(item, "quantity", 0) or 0) or int(GLOBAL_CACHE.Item.Properties.GetQuantity(item_id))
+            item_type = int(GLOBAL_CACHE.Item.GetItemType(item_id)[0])
+            is_id_kit = bool(GLOBAL_CACHE.Item.Usage.IsIDKit(item_id)) or model_id in InventoryTransfer.ID_KIT_MODELS
+            is_salvage_kit = (
+                bool(GLOBAL_CACHE.Item.Usage.IsSalvageKit(item_id)) or model_id in InventoryTransfer.SALVAGE_KIT_MODELS
+            )
+
+            records.append(
+                InventoryTransfer.ItemRecord(
+                    bag_id=bag_id,
+                    slot=slot,
+                    model_id=model_id,
+                    quantity=max(quantity, 1),
+                    item_id=item_id,
+                    stackable=bool(GLOBAL_CACHE.Item.Properties.IsStackable(item_id)),
+                    tradable=bool(GLOBAL_CACHE.Item.Properties.IsTradable(item_id)),
+                    customized=bool(GLOBAL_CACHE.Item.Properties.IsCustomized(item_id)),
+                    item_type=item_type,
+                    is_id_kit=is_id_kit,
+                    is_salvage_kit=is_salvage_kit,
+                )
+            )
+
+    records.sort(key=lambda record: record.sort_key)
+    return records
+
+
+def _transfer_ground_item_ids(center: tuple[float, float], radius: float) -> set[int]:
+    """Ground items at the rally point this character is allowed to take.
+
+    Delegates to `Items.GetGroundItemIds`, which owns the predicate that
+    `Items.LootGroundItems` also collects by: unowned, or still reserved for us, which is
+    what recalling our own drop needs. Counted before and after a collect so the report
+    carries items that actually left the ground rather than a free-slot delta, which stack
+    merges hide -- and it has to be the *same* predicate as the collection, or the two
+    disagree and the round reports a number nobody can act on.
+    """
+    return {int(agent_id) for agent_id in Routines.Yield.Items.GetGroundItemIds(radius=radius, center=center)}
+
+
+@dataclass
+class _HeroAIHold:
+    """One account's HeroAI suspension, owned by a transfer session."""
+
+    session_id: str
+    deadline: int
+    saved: HeroAIoptions
+
+
+# Keyed by account email. Swept every frame by `_tick_hero_ai_holds`, which is what
+# restores the options -- deliberately NOT the message handler that started the hold.
+_hero_ai_holds: dict[str, _HeroAIHold] = {}
+
+
+def TransferHoldHeroAI(index: int, message: SharedMessageStruct) -> None:
+    """Take or extend a session-scoped HeroAI suspension. Returns immediately.
+
+    Params: (nonce, lease_ms, 0, 0). ExtraData: (session_id, "", "", "").
+
+    **Why this exists.** A per-message suspension is not enough, which a live run
+    proved: `TransferDropItems` restores in its own `finally`, which fires the moment a
+    donor has finished dropping -- while the receiver is still walking to the pile -- so
+    the donor's `Looting` comes back on and it retakes its own drop. And any party
+    member that is sent no transfer message never stops looting at all.
+
+    **Why it is not a long-running handler**, which was the obvious way to write it and
+    is wrong. `AllAccounts.SendMessage` short-circuits on *any* fresh `Running` message
+    between the same sender and receiver, before it ever compares the command
+    (`AllAccounts.py:964`). A handler that stays `Running` to keep its message `Active`
+    therefore swallows every subsequent message the coordinator sends that account for
+    `_MESSAGE_RUNNING_STALE_MS` -- 60 seconds. Observed live on 2026-09-07: the donor
+    received no drop command at all until the hold went stale, then did a whole round in
+    one second.
+
+    So the hold owns its own captured options instead of pushing onto
+    `hero_ai_snapshots`, and `_tick_hero_ai_holds` re-asserts and eventually restores
+    them. Staying off that stack also keeps `HealStaleHeroAISnapshot` out of the way: it
+    only drains accounts that have snapshots on it, and this never puts one there.
+
+    The lease is what makes holding one safe at all. A suspension with no expiry is the
+    single worst outcome available here -- a character unable to fight or loot with
+    nothing alive to restore it -- so an unrenewed hold lapses on its own.
+    """
+    account_email = str(message.ReceiverEmail or "")
+    GLOBAL_CACHE.ShMem.MarkMessageAsRunning(account_email, index)
+    try:
+        session_id, _extra1, _extra2, _extra3 = _extra_data(message)
+        session_id = str(session_id or "").strip()
+        deadline = int(PySystem.get_tick_count64()) + max(int(message.Params[1]), 0)
+
+        existing = _hero_ai_holds.get(account_email)
+        if existing is not None and existing.session_id == session_id:
+            existing.deadline = max(existing.deadline, deadline)
+        elif existing is not None:
+            # Another session already owns this account. Refuse rather than capture
+            # options that are already suspended and later "restore" them to that.
+            ConsoleLog(
+                MODULE_NAME,
+                f"[Transfer] Hero AI already held by session {existing.session_id}; ignoring {session_id}.",
+                Console.MessageType.Warning,
+                log=True,
+            )
+        else:
+            saved = _capture_hero_ai_options(account_email)
+            if saved is not None:
+                _hero_ai_holds[account_email] = _HeroAIHold(
+                    session_id=session_id, deadline=deadline, saved=saved
+                )
+                DisableHeroAIOptions(account_email)
+                ConsoleLog(
+                    MODULE_NAME,
+                    f"[Transfer] Hero AI held for session {session_id} for up to "
+                    f"{max(int(message.Params[1]), 0) // 1000} s.",
+                    Console.MessageType.Info,
+                    log=True,
+                )
+    except Exception as exc:
+        ConsoleLog(MODULE_NAME, f"[Transfer] Could not hold Hero AI: {exc}", Console.MessageType.Error, log=True)
+    finally:
+        GLOBAL_CACHE.ShMem.MarkMessageAsFinished(account_email, index)
+
+
+def TransferReleaseHeroAI(index: int, message: SharedMessageStruct) -> None:
+    """End a HeroAI hold now rather than waiting out its lease.
+
+    Params: (nonce, 0, 0, 0). ExtraData: (session_id, "", "", "").
+
+    An empty session id means "release whatever is held here", which is what the
+    widget's manual escape hatch sends: someone reaching for that button does not know
+    which session id stranded them, and is entitled not to care.
+    """
+    account_email = str(message.ReceiverEmail or "")
+    GLOBAL_CACHE.ShMem.MarkMessageAsRunning(account_email, index)
+    try:
+        session_id, _extra1, _extra2, _extra3 = _extra_data(message)
+        session_id = str(session_id or "").strip()
+        held = _hero_ai_holds.get(account_email)
+        if held is not None and (not session_id or held.session_id == session_id):
+            _release_hero_ai_hold(account_email, "released")
+    except Exception as exc:
+        ConsoleLog(MODULE_NAME, f"[Transfer] Could not release a Hero AI hold: {exc}", Console.MessageType.Error, log=True)
+    finally:
+        GLOBAL_CACHE.ShMem.MarkMessageAsFinished(account_email, index)
+
+
+def _release_hero_ai_hold(account_email: str, why: str) -> None:
+    """Put an account's HeroAI options back exactly as the hold found them."""
+    held = _hero_ai_holds.pop(account_email, None)
+    if held is None:
+        return
+    _apply_hero_ai_options(account_email, held.saved)
+    ConsoleLog(
+        MODULE_NAME,
+        f"[Transfer] Hero AI hold for session {held.session_id} {why}.",
+        Console.MessageType.Info,
+        log=True,
+    )
+
+
+def _tick_hero_ai_holds(account_email: str) -> None:
+    """Keep this account's hold enforced, and end it when its lease runs out.
+
+    Called every frame from `main()` rather than from the handler that started the
+    hold. That is the point: a coroutine can die, a widget can be disabled, a session
+    can be aborted without ever sending its release -- and none of those may leave a
+    character permanently unable to fight or loot. The sweeper is the thing that always
+    runs, so it is the thing that owns giving the options back.
+    """
+    held = _hero_ai_holds.get(account_email)
+    if held is None:
+        return
+
+    if int(PySystem.get_tick_count64()) >= held.deadline:
+        _release_hero_ai_hold(account_email, "lapsed; options restored")
+        return
+
+    # Re-asserted rather than set once: a nested round handler restores the state it
+    # captured when it finishes, and other subsystems write these flags too.
+    DisableHeroAIOptions(account_email)
+
+
+def TransferDropItems(index: int, message: SharedMessageStruct):
+    """Donor side of one round: drop up to a budget of whole stacks at the rally point.
+
+    Params: (round_id, max_items, rally_x, rally_y).
+    ExtraData: (policy_name, session_id, stack_limit, "").
+
+    `stack_limit` is the one part of the policy that does not ride on the policy *name*.
+    It has to be a value because it is a per-session decision -- how many drop calls the
+    coordinator is willing to spend on one inventory slot, given that the native binding
+    moves one unit per call -- and a name has no room to say it. An absent or unreadable
+    field resolves to the conservative default, which is "unstacked items only", so a
+    coordinator that did not ask for stacks never gets them by accident.
+
+    Snapshot/restore of the HeroAI options is a strict stack, and this handler's pair is
+    the *only* suspension a transfer round is guaranteed to have. The widget deliberately
+    sends no session-scoped DisableHeroAI, because one closing EnableHeroAI cannot pop a
+    snapshot pushed once per round -- see section 6.8 of the plan. Nesting inside an
+    outer suspension still works if some other caller has one open: the inner restore
+    puts back options that were already suspended, and the outer restore still returns
+    the user's real settings.
+    """
+    global _transfer_busy
+
+    donor_email = str(message.ReceiverEmail or "")
+    coordinator_email = str(message.SenderEmail or "")
+    round_id = int(message.Params[0])
+    max_items = int(message.Params[1])
+    rally_x = float(message.Params[2])
+    rally_y = float(message.Params[3])
+    policy_name, session_id, stack_limit_field, _extra3 = _extra_data(message)
+
+    status = InventoryTransfer.STATUS_OK
+    items_dropped = 0
+    slots_freed = 0
+    holds_lock = False
+    suspended = False
+
+    GLOBAL_CACHE.ShMem.MarkMessageAsRunning(donor_email, index)
+    try:
+        if _transfer_busy:
+            status = InventoryTransfer.STATUS_BUSY
+            ConsoleLog(
+                MODULE_NAME,
+                f"[Transfer] Round {round_id}: another transfer step is running, refusing the drop.",
+                Console.MessageType.Warning,
+                log=True,
+            )
+            return
+
+        _transfer_busy = True
+        holds_lock = True
+
+        if not Routines.Checks.Map.IsExplorable():
+            # A5: dropping is refused outside explorable areas. Reported rather than
+            # attempted, so the coordinator learns why the round did nothing.
+            status = InventoryTransfer.STATUS_NOT_EXPLORABLE
+            ConsoleLog(
+                MODULE_NAME,
+                f"[Transfer] Round {round_id}: not in an explorable area, dropping nothing.",
+                Console.MessageType.Warning,
+                log=True,
+            )
+            return
+
+        if max_items <= 0:
+            status = InventoryTransfer.STATUS_NO_BUDGET
+            ConsoleLog(
+                MODULE_NAME,
+                f"[Transfer] Round {round_id}: no drop budget was granted.",
+                Console.MessageType.Warning,
+                log=True,
+            )
+            return
+
+        SnapshotHeroAIOptions(donor_email)
+        DisableHeroAIOptions(donor_email)
+        suspended = True
+
+        if rally_x or rally_y:
+            if Utils.Distance(Player.GetXY(), (rally_x, rally_y)) > _TRANSFER_RALLY_TOLERANCE:
+                reached = yield from Routines.Yield.Movement.FollowPath(
+                    [(rally_x, rally_y)],
+                    timeout=_TRANSFER_RALLY_TIMEOUT_MS,
+                )
+                if not reached:
+                    # No fallback drop on purpose: a pile scattered along a failed path is
+                    # worse than a round that moved nothing, because the receiver only
+                    # walks the rally point.
+                    status = InventoryTransfer.STATUS_RALLY_FAILED
+                    ConsoleLog(
+                        MODULE_NAME,
+                        f"[Transfer] Round {round_id}: could not reach the rally point, dropping nothing.",
+                        Console.MessageType.Warning,
+                        log=True,
+                    )
+                    return
+
+        # The named policy, with the session's stack limit written over it. Rebuilding
+        # the policy this way rather than trusting the name alone keeps one filter in
+        # play: the same object decides what is eligible here and what the coordinator
+        # budgeted, so a stack the preview refused is refused here for the same reason.
+        policy = InventoryTransfer.resolve_wire_policy(policy_name, stack_limit_field)
+        stack_limit = policy.stack_limit
+        droppable = InventoryTransfer.select_droppable(_read_local_transfer_items(), policy)[:max_items]
+        if not droppable:
+            status = InventoryTransfer.STATUS_NOTHING_ELIGIBLE
+            ConsoleLog(
+                MODULE_NAME,
+                f"[Transfer] Round {round_id}: nothing eligible under policy {policy.name} "
+                f"(stacks up to {stack_limit}).",
+                Console.MessageType.Info,
+                log=True,
+            )
+            return
+
+        dropped = yield from Routines.Yield.Items.DropItems(
+            [record.item_id for record in droppable],
+            max_units_per_item=stack_limit,
+        )
+        items_dropped = len(dropped)
+        # Counted, not measured. `DropItems` returns only items that left the bags
+        # entirely, and each of those vacated exactly one bag slot however many drop
+        # calls it took to empty. A GetFreeSlotCount delta claimed 32 freed slots for a
+        # single dropped item during the live run on 2026-09-03.
+        slots_freed = items_dropped
+
+        if items_dropped == 0:
+            # Eligible items that all refused to leave the bags is a real failure, not an
+            # empty inventory: say so rather than reporting a clean round of nothing.
+            status = InventoryTransfer.STATUS_ERROR
+
+        ConsoleLog(
+            MODULE_NAME,
+            f"[Transfer] Round {round_id}: dropped {items_dropped} of {len(droppable)} planned item(s), freeing {slots_freed} slot(s).",
+            Console.MessageType.Info,
+            log=True,
+        )
+    except Exception as exc:
+        status = InventoryTransfer.STATUS_ERROR
+        ConsoleLog(MODULE_NAME, f"[Transfer] Drop round {round_id} failed: {exc}", Console.MessageType.Error, log=True)
+    finally:
+        if suspended:
+            RestoreHeroAISnapshot(donor_email)
+        if holds_lock:
+            _transfer_busy = False
+        # Finish *before* reporting, not after. SendMessage short-circuits on any fresh
+        # Running message between the same pair of accounts, so a report sent while this
+        # message is still marked running is silently dropped -- which is exactly what
+        # happened to the receiver's own report, since the coordinator is the receiver.
+        GLOBAL_CACHE.ShMem.MarkMessageAsFinished(donor_email, index)
+        _send_transfer_report(coordinator_email, donor_email, session_id, round_id, items_dropped, slots_freed, status)
+
+
+def TransferPickUpItems(index: int, message: SharedMessageStruct):
+    """Receiver side of one round: walk the pile at the rally point and collect it.
+
+    Params: (round_id, max_items, radius, unused).
+    ExtraData: (session_id, "", "", "").
+
+    Reports like a donor does. The plan only required donor reports, but the receiver's
+    report is the one edge that says a round is over: without it the coordinator would
+    have to infer completion from a shared-memory snapshot that is up to 1.5 s stale. It
+    costs one message per round and no new command.
+    """
+    global _transfer_busy
+
+    receiver_email = str(message.ReceiverEmail or "")
+    coordinator_email = str(message.SenderEmail or "")
+    round_id = int(message.Params[0])
+    max_items = int(message.Params[1])
+    radius = float(message.Params[2]) or float(Range.Earshot.value)
+    session_id, _extra1, _extra2, _extra3 = _extra_data(message)
+
+    status = InventoryTransfer.STATUS_OK
+    items_collected = 0
+    slots_used = 0
+    holds_lock = False
+    suspended = False
+
+    GLOBAL_CACHE.ShMem.MarkMessageAsRunning(receiver_email, index)
+    try:
+        if _transfer_busy:
+            status = InventoryTransfer.STATUS_BUSY
+            ConsoleLog(
+                MODULE_NAME,
+                f"[Transfer] Round {round_id}: another transfer step is running, refusing the pickup.",
+                Console.MessageType.Warning,
+                log=True,
+            )
+            return
+
+        _transfer_busy = True
+        holds_lock = True
+
+        if not Routines.Checks.Map.IsExplorable():
+            status = InventoryTransfer.STATUS_NOT_EXPLORABLE
+            ConsoleLog(
+                MODULE_NAME,
+                f"[Transfer] Round {round_id}: not in an explorable area, collecting nothing.",
+                Console.MessageType.Warning,
+                log=True,
+            )
+            return
+
+        # The rally point is where the receiver stands when the round starts. It walks the
+        # pile from there, so every later read uses this fixed centre rather than the
+        # current position.
+        rally_point = Player.GetXY()
+
+        # Suspend before counting the pile: this client's own HeroAI Looting would
+        # otherwise be free to take an item between the count and the collect, and the
+        # report would blame the difference on the transfer.
+        SnapshotHeroAIOptions(receiver_email)
+        DisableHeroAIOptions(receiver_email)
+        suspended = True
+
+        before = _transfer_ground_item_ids(rally_point, radius)
+        if not before:
+            status = InventoryTransfer.STATUS_NOTHING_ELIGIBLE
+            ConsoleLog(
+                MODULE_NAME,
+                f"[Transfer] Round {round_id}: no free ground items within {int(radius)} of the rally point.",
+                Console.MessageType.Info,
+                log=True,
+            )
+            return
+
+        free_before = int(GLOBAL_CACHE.Inventory.GetFreeSlotCount())
+        collected_all = yield from Routines.Yield.Items.LootGroundItems(
+            radius=radius,
+            max_items=max(max_items, 0),
+            center=rally_point,
+        )
+        # Everything that left the ground. A party member looting the same pile would
+        # inflate this; HeroAI is suspended on every participant precisely so it does not.
+        items_collected = len(before - _transfer_ground_item_ids(rally_point, radius))
+        # Clamped to what those items could possibly have cost: a merged stack takes no
+        # new slot, a fresh one takes exactly one. The raw free-slot delta is not
+        # trustworthy on its own -- see the drop side.
+        slots_used = min(max(free_before - int(GLOBAL_CACHE.Inventory.GetFreeSlotCount()), 0), items_collected)
+
+        if not collected_all:
+            if int(GLOBAL_CACHE.Inventory.GetFreeSlotCount()) <= 0:
+                status = InventoryTransfer.STATUS_INVENTORY_FULL
+            else:
+                status = InventoryTransfer.STATUS_ERROR
+
+        ConsoleLog(
+            MODULE_NAME,
+            f"[Transfer] Round {round_id}: collected {items_collected} of {len(before)} ground item(s), filling {slots_used} slot(s).",
+            Console.MessageType.Info,
+            log=True,
+        )
+    except Exception as exc:
+        status = InventoryTransfer.STATUS_ERROR
+        ConsoleLog(MODULE_NAME, f"[Transfer] Pickup round {round_id} failed: {exc}", Console.MessageType.Error, log=True)
+    finally:
+        if suspended:
+            RestoreHeroAISnapshot(receiver_email)
+        if holds_lock:
+            _transfer_busy = False
+        # Finished first: see the note on the drop handler. When the coordinator is also
+        # the receiver -- which the widget guarantees -- sender and receiver are the same
+        # account, so reporting while this message is still running loses the report and
+        # the coordinator waits out its whole collect timeout every single round.
+        GLOBAL_CACHE.ShMem.MarkMessageAsFinished(receiver_email, index)
+        _send_transfer_report(
+            coordinator_email, receiver_email, session_id, round_id, items_collected, slots_used, status
+        )
+
+
+def TransferReport(index: int, message: SharedMessageStruct) -> None:
+    """Coordinator side: file one participant's round result for the session to reconcile.
+
+    Params: (round_id, items_moved, slots_used, status).
+    ExtraData: (session_id, reporter_email, "", "").
+
+    A plain function rather than a coroutine, following the AccountSettingsSyncResult
+    precedent: there is nothing here to wait for.
+    """
+    receiver_email = str(message.ReceiverEmail or "")
+    GLOBAL_CACHE.ShMem.MarkMessageAsRunning(receiver_email, index)
+    try:
+        round_id = int(message.Params[0])
+        items_moved = int(message.Params[1])
+        slots_used = int(message.Params[2])
+        status = int(message.Params[3])
+        session_id, reporter_email, _extra2, _extra3 = _extra_data(message)
+        reporter_email = str(reporter_email or message.SenderEmail or "").strip()
+
+        entry = TransferReportEntry(
+            session_id=str(session_id or "").strip(),
+            round_id=round_id,
+            reporter_email=reporter_email,
+            items_moved=items_moved,
+            slots_used=slots_used,
+            status=status,
+            timestamp=int(PySystem.get_tick_count64()),
+        )
+        InventoryTransfer.file_transfer_report(entry)
+
+        ConsoleLog(
+            MODULE_NAME,
+            f"[Transfer] Round {round_id} report from {reporter_email}: {items_moved} item(s), {slots_used} slot(s), {entry.status_text}.",
+            Console.MessageType.Info,
+            log=True,
+        )
+    except Exception as exc:
+        ConsoleLog(MODULE_NAME, f"[Transfer] Could not file a round report: {exc}", Console.MessageType.Error, log=True)
+    finally:
+        GLOBAL_CACHE.ShMem.MarkMessageAsFinished(receiver_email, index)
+
+
+# endregion
+
+
 # region ProcessMessages
 def ProcessMessages():
     account_email = Player.GetAccountEmail()
@@ -3690,6 +4287,16 @@ def ProcessMessages():
             GLOBAL_CACHE.Coroutines.append(CollectorExchange(index, message))
         case SharedCommandType.AddModelToLootWhitelist:
             GLOBAL_CACHE.Coroutines.append(AddModelToLootWhitelist(index, message))
+        case SharedCommandType.TransferHoldHeroAI:
+            TransferHoldHeroAI(index, message)
+        case SharedCommandType.TransferReleaseHeroAI:
+            TransferReleaseHeroAI(index, message)
+        case SharedCommandType.TransferDropItems:
+            GLOBAL_CACHE.Coroutines.append(TransferDropItems(index, message))
+        case SharedCommandType.TransferPickUpItems:
+            GLOBAL_CACHE.Coroutines.append(TransferPickUpItems(index, message))
+        case SharedCommandType.TransferReport:
+            TransferReport(index, message)
         case SharedCommandType.AccountSettingsSync:
             AccountSettingsSync(index, message)
         case SharedCommandType.AccountSettingsSyncResult:
@@ -3709,7 +4316,9 @@ def ProcessMessages():
 
 
 def main():
-    HealStaleHeroAISnapshot(Player.GetAccountEmail())
+    _account_email = Player.GetAccountEmail()
+    HealStaleHeroAISnapshot(_account_email)
+    _tick_hero_ai_holds(_account_email)
     _process_pending_widget_enables()
     ProcessMessages()
     try:
