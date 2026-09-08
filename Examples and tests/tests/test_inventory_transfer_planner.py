@@ -14,9 +14,12 @@ The module is loaded straight off disk rather than imported as
 ever stops loading that way, the planner has grown a dependency it should not
 have -- and `test_planner_stays_client_free` says so out loud.
 
-Every stack number rests on plan assumptions A1, A4 and A7, none of which is
-verified against a live client. These checks prove the arithmetic is what the
-plan says it is; they cannot prove the game agrees.
+The stack assumptions were settled live on 2026-09-03: A4 and A7 held, and A1
+did not -- the native binding drops one unit per call whatever quantity it is
+handed. The planner works around that with a stack limit rather than pretending
+it is fixed, so the fixtures here opt into whole stacks explicitly and the gate
+gets its own section. These checks prove the arithmetic is what the plan says it
+is; they still cannot prove the game agrees.
 
 Run:  python "Examples and tests/tests/test_inventory_transfer_planner.py"
 Exit code 1 on any failure.
@@ -132,9 +135,16 @@ def slots(*pairs: tuple[int, int]) -> list[Any]:
     return [IT.ProjectedSlot(model_id=model, quantity=quantity) for model, quantity in pairs]
 
 
-DEFAULT = IT.TransferPolicy()
-NO_MARGIN = IT.TransferPolicy(safety_margin=0)
-OPTIMISTIC = IT.TransferPolicy(optimistic_merge=True, safety_margin=0)
+# Every policy below opts into whole stacks. The shipped default is
+# `max_stack_quantity = 1` -- "unstacked items only", because the native binding
+# drops one unit per call -- and leaving these at that default would make the
+# stack gate refuse every fixture in this file, silently gutting the merge and
+# budget coverage rather than testing it. The gate has its own section instead.
+STACKS_OK = IT.STACK_MAX
+
+DEFAULT = IT.TransferPolicy(max_stack_quantity=STACKS_OK)
+NO_MARGIN = IT.TransferPolicy(safety_margin=0, max_stack_quantity=STACKS_OK)
+OPTIMISTIC = IT.TransferPolicy(optimistic_merge=True, safety_margin=0, max_stack_quantity=STACKS_OK)
 
 
 # ---------------------------------------------------------------------------
@@ -325,7 +335,7 @@ def test_selection_gates() -> None:
 def test_protected_models_and_floors() -> None:
     section("protected models and quantity floors")
 
-    policy = IT.TransferPolicy(protected_models=(DYE,))
+    policy = IT.TransferPolicy(protected_models=(DYE,), max_stack_quantity=STACKS_OK)
     items = [live_item(IRON, 5, slot=0, stackable=True), live_item(DYE, 3, slot=1, stackable=True)]
     taken = IT.select_droppable(items, policy)
     check("protected model excluded", [item.model_id for item in taken] == [IRON], repr(taken))
@@ -335,7 +345,7 @@ def test_protected_models_and_floors() -> None:
 
     # "Keep 5 cupcakes": drops are whole stacks (A1), so the only stack that
     # may go is the one that still leaves the floor standing.
-    floors = IT.TransferPolicy(model_floors=((IRON, 5),))
+    floors = IT.TransferPolicy(model_floors=((IRON, 5),), max_stack_quantity=STACKS_OK)
     stacks = [live_item(IRON, 10, slot=0, stackable=True), live_item(IRON, 3, slot=1, stackable=True)]
     kept = IT.select_droppable(stacks, floors)
     check("floor keeps the stack it has to", [item.quantity for item in kept] == [3], repr(kept))
@@ -345,7 +355,7 @@ def test_protected_models_and_floors() -> None:
         IT.select_droppable([live_item(IRON, 6, stackable=True)], floors) == (),
     )
 
-    whitelisted = IT.TransferPolicy(model_whitelist=(IRON,))
+    whitelisted = IT.TransferPolicy(model_whitelist=(IRON,), max_stack_quantity=STACKS_OK)
     check(
         "whitelist excludes everything unlisted",
         [item.model_id for item in IT.select_droppable(items, whitelisted)] == [IRON],
@@ -612,6 +622,25 @@ def test_reconcile_round() -> None:
     IT.reconcile_round(plan, {"a@x": 3}, 6, 6, 3, tracker)
     second = IT.reconcile_round(plan, {"a@x": 3}, 6, 6, 6, tracker)
     check("two rounds that moved nothing stall", second.stalled and second.slots_used == 0)
+
+    # The free-slot delta under-counts every merge: an item that lands in an
+    # existing stack costs no slot at all. Two such rounds in a row would stall a
+    # session that is working, so the receiver's own report wins when there is one.
+    merged = IT.StallTracker()
+    IT.reconcile_round(plan, {"a@x": 3}, 6, 6, 0, merged, collected_items=3)
+    still_going = IT.reconcile_round(plan, {"a@x": 3}, 6, 6, 0, merged, collected_items=3)
+    check("a round that merged everything is not a stall", not still_going.stalled)
+    check("and it reports what the receiver said it took", still_going.collected_items == 3)
+
+    starved = IT.StallTracker()
+    IT.reconcile_round(plan, {"a@x": 3}, 6, 6, 3, starved, collected_items=0)
+    twice = IT.reconcile_round(plan, {"a@x": 3}, 6, 6, 3, starved, collected_items=0)
+    check("but a reported zero still stalls", twice.stalled)
+
+    check(
+        "without a report the old derivation still applies",
+        IT.reconcile_round(plan, {"a@x": 3}, 6, 4, 1).collected_items == 2,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1065,7 +1094,7 @@ def test_coordinator_exclusions_are_proven_only() -> None:
     section("the preview lists proven exclusions, not unknowns")
 
     items = [snapshot_item(IRON, 250, slot=0), snapshot_item(DYE, 1, slot=1)]
-    policy = IT.TransferPolicy(protected_models=(DYE,))
+    policy = IT.TransferPolicy(protected_models=(DYE,), max_stack_quantity=STACKS_OK)
 
     excluded = IT.explain_exclusions(items, policy)
     check("only the proven-protected item is excluded", len(excluded) == 1, repr(excluded))
@@ -1082,6 +1111,241 @@ def test_coordinator_exclusions_are_proven_only() -> None:
         any(result.verdict == IT.VERDICT_UNVERIFIED for _item, result in rejected),
         repr(rejected),
     )
+
+
+# ---------------------------------------------------------------------------
+# 12. The stack gate -- the workaround for the disproved A1
+# ---------------------------------------------------------------------------
+
+
+def test_stack_limit_gate() -> None:
+    section("stacks larger than the limit never move")
+
+    shipped = IT.TransferPolicy()
+    check("the shipped default is unstacked items only", shipped.stack_limit == 1)
+    check(
+        "every built-in policy agrees",
+        all(policy.stack_limit == 1 for policy in IT.BUILTIN_POLICIES.values()),
+        repr({name: policy.stack_limit for name, policy in IT.BUILTIN_POLICIES.items()}),
+    )
+
+    single = live_item(IRON, 1, slot=0, stackable=True)
+    pair = live_item(IRON, 2, slot=1, stackable=True)
+    check("a single unit passes the default", IT.evaluate_item(single, shipped, IT.DonorContext()).droppable)
+    refused = IT.evaluate_item(pair, shipped, IT.DonorContext())
+    check("a stack of two does not", refused.blocked, repr(refused))
+    check("and it says why", refused.reason == IT.REASON_STACK_TOO_LARGE, refused.reason)
+
+    five = IT.TransferPolicy(max_stack_quantity=5)
+    check("a raised limit admits its own size", IT.evaluate_item(live_item(IRON, 5, stackable=True), five, IT.DonorContext()).droppable)
+    check("and refuses one more", IT.evaluate_item(live_item(IRON, 6, stackable=True), five, IT.DonorContext()).blocked)
+
+    # The gate has to be decided identically on both sides, or the coordinator
+    # budgets a stack the donor will refuse and every round comes up short. The
+    # snapshot record below has every tri-state flag unresolved, which is what
+    # makes it *plannable* -- but quantity is never unresolved, so the verdict
+    # here is a hard block on both sides rather than an unverified pass.
+    snapshot_stack = snapshot_item(IRON, 4, slot=0)
+    coordinator_view = IT.evaluate_item(snapshot_stack, shipped, IT.DonorContext())
+    check("the coordinator blocks it too, not merely unverified", coordinator_view.blocked, repr(coordinator_view))
+    check("for the same stated reason", coordinator_view.reason == IT.REASON_STACK_TOO_LARGE)
+    check(
+        "so it never reaches a round plan",
+        IT.select_plannable([snapshot_stack], shipped) == (),
+    )
+    check(
+        "and the preview lists it as excluded",
+        [result.reason for _item, result in IT.explain_exclusions([snapshot_stack], shipped)]
+        == [IT.REASON_STACK_TOO_LARGE],
+    )
+
+    check(
+        "the limit floors at one rather than disabling the transfer",
+        IT.TransferPolicy(max_stack_quantity=0).stack_limit == 1,
+    )
+    check(
+        "and is not silently capped, so a policy means what it says",
+        IT.TransferPolicy(max_stack_quantity=250).stack_limit == 250,
+    )
+
+
+def test_ground_pile_accounting() -> None:
+    section("a stack becomes one ground pile per unit")
+
+    # One drop call per unit (A1 disproved), so a donor asked to move a stack of
+    # three leaves three piles. The receiver's pickup budget counts piles; if it
+    # counted bag slots it would collect one and walk away from the other two.
+    three = IT.TransferPolicy(max_stack_quantity=3, safety_margin=0)
+    items = [live_item(IRON, 3, slot=0, stackable=True), live_item(DYE, 1, slot=1)]
+    plan = IT.plan_round(1, IT.ReceiverProjection(free_slots=10), [donor("a@x", items)], three)
+
+    check("both items are planned", plan.item_count == 2, repr(plan.drops))
+    check("but four piles hit the floor", plan.ground_item_count == 4, repr(plan.ground_item_count))
+    check("counted per donor as well", plan.ground_items_for("a@x") == 4)
+    check("the donor's own budget stays in items", plan.budget_for("a@x") == 2)
+
+    stack_drop = next(drop for drop in plan.drops if drop.item.model_id == IRON)
+    check("the stack alone is three piles", stack_drop.ground_items == 3)
+    check("and still reserves one receiver slot", stack_drop.slot_cost == 1)
+
+    check(
+        "a single item is one pile",
+        next(drop for drop in plan.drops if drop.item.model_id == DYE).ground_items == 1,
+    )
+
+
+def test_stack_limit_wire_field() -> None:
+    section("the stack limit crosses the wire in ExtraData[2]")
+
+    check("it round-trips", IT.parse_stack_limit(IT.format_stack_limit(5)) == 5)
+    check("the rendered form is short enough for the field", len(IT.format_stack_limit(20)) < 63)
+    check("a bare integer is accepted too", IT.parse_stack_limit("7") == 7)
+
+    # An unset field means a coordinator that did not ask for stacks. The quiet
+    # answer to that is to move none -- never to guess a larger number.
+    check("an empty field falls back to the default", IT.parse_stack_limit("") == IT.DEFAULT_MAX_STACK_QUANTITY)
+    check("so does an unreadable one", IT.parse_stack_limit("stack=lots") == IT.DEFAULT_MAX_STACK_QUANTITY)
+    check("the caller may name its own fallback", IT.parse_stack_limit("", default=4) == 4)
+
+    check("an absurd request is clamped, not honoured", IT.parse_stack_limit("stack=9999") == IT.MAX_STACK_QUANTITY)
+    check("and so is a negative one", IT.parse_stack_limit("stack=-3") == 1)
+    check("formatting clamps on the way out too", IT.format_stack_limit(9999).endswith(str(IT.MAX_STACK_QUANTITY)))
+
+    # Both sides rebuild the policy through one function, so a stack the preview
+    # refused is refused by the donor for the same stated reason.
+    wired = IT.resolve_wire_policy("stackables", IT.format_stack_limit(5))
+    check("the named policy still decides everything else", wired.name == "stackables" and wired.stackables_only)
+    check("and the loose field decides the stack limit", wired.stack_limit == 5)
+    check(
+        "an unknown name still falls back to default without losing the limit",
+        IT.resolve_wire_policy("nonsense", "stack=3").name == "default"
+        and IT.resolve_wire_policy("nonsense", "stack=3").stack_limit == 3,
+    )
+    check("a message with no stack field moves no stacks", IT.resolve_wire_policy("default", "").stack_limit == 1)
+
+
+# ---------------------------------------------------------------------------
+# 13. Round reports -- what the live session waits on
+# ---------------------------------------------------------------------------
+
+
+def report(reporter: str, round_id: int = 1, moved: int = 0, status: int | None = None, session: str = "s1") -> Any:
+    return IT.TransferReportEntry(
+        session_id=session,
+        round_id=round_id,
+        reporter_email=reporter,
+        items_moved=moved,
+        slots_used=moved,
+        status=IT.STATUS_OK if status is None else status,
+    )
+
+
+def test_report_store() -> None:
+    section("the report store keeps one answer per participant per round")
+
+    IT.clear_transfer_reports("s1")
+    IT.file_transfer_report(report("donor@x", moved=2))
+    IT.file_transfer_report(report("recv@x", moved=2))
+    check("both are filed", len(IT.get_transfer_reports("s1", 1)) == 2)
+
+    # A participant that answers twice for one round must overwrite, not
+    # double-count: a report is how the coordinator decides a round is finished,
+    # and two of them would end the round on the first.
+    IT.file_transfer_report(report("donor@x", moved=5))
+    filed = IT.get_transfer_reports("s1", 1)
+    check("a second answer replaces the first", len(filed) == 2, repr(filed))
+    check("with the newer value", any(entry.items_moved == 5 for entry in filed))
+
+    IT.file_transfer_report(report("donor@x", round_id=2, moved=1))
+    check("rounds stay separate", len(IT.get_transfer_reports("s1", 2)) == 1)
+    check("and the session view spans both", len(IT.get_transfer_reports("s1")) == 3)
+
+    IT.file_transfer_report(report("donor@x", session="s2"))
+    IT.clear_transfer_reports("s1")
+    check("clearing one session leaves the other", IT.get_transfer_reports("s1") == ())
+    check("the other session survives", len(IT.get_transfer_reports("s2")) == 1)
+    IT.clear_transfer_reports("s2")
+
+    # A coordinator clears each round as it reconciles it, but nothing is obliged
+    # to: an aborted session or a recall leaves entries with no owner. The store
+    # has to be self-limiting or it grows for as long as the client runs.
+    for index in range(IT.MAX_ROUND_REPORTS + 50):
+        IT.file_transfer_report(report("donor@x", round_id=index, session="flood"))
+    check(
+        "the store stops growing at its bound",
+        len(IT.get_transfer_reports("flood")) <= IT.MAX_ROUND_REPORTS,
+        str(len(IT.get_transfer_reports("flood"))),
+    )
+    check(
+        "and it is the newest reports that survive",
+        any(entry.round_id == IT.MAX_ROUND_REPORTS + 49 for entry in IT.get_transfer_reports("flood")),
+    )
+    IT.clear_transfer_reports("flood")
+
+
+def test_instance_cohort() -> None:
+    section("the whole instance gets quietened, not just the participants")
+
+    # A live run showed the party racing the receiver for the pile: selecting donors
+    # decides whose items move, and has nothing to do with who can interfere.
+    home = participant("recv", map_id=100, party_id=7)
+    everyone = [
+        home,
+        participant("donor", map_id=100, party_id=7),
+        participant("bystander", map_id=100, party_id=7),
+        participant("other_party", map_id=100, party_id=9),
+        participant("other_map", map_id=200, party_id=7),
+        participant("solo", map_id=100, party_id=0),
+    ]
+
+    cohort = IT.accounts_sharing_instance(home, everyone)
+    check("the receiver is included", "recv" in cohort, repr(cohort))
+    check("so is a donor", "donor" in cohort)
+    check("and so is a bystander nobody selected", "bystander" in cohort, repr(cohort))
+    check("a different party is not", "other_party" not in cohort)
+    check("a different map is not", "other_map" not in cohort)
+    check("and neither is a partyless account on the same map", "solo" not in cohort)
+    check("nobody is listed twice", len(set(cohort)) == len(cohort))
+
+    check(
+        "a partyless receiver quietens nobody, because it shares no instance",
+        IT.accounts_sharing_instance(participant("recv", map_id=100, party_id=0), everyone) == (),
+    )
+
+
+def test_round_outcome() -> None:
+    section("a round is over when everyone asked has answered")
+
+    donors = ("d1@x", "d2@x")
+
+    waiting = IT.summarize_round_reports(1, "s1", "recv@x", donors, reports=[report("d1@x", moved=2)])
+    check("one donor short is not complete", not waiting.drops_complete)
+    check("and it names who is missing", waiting.missing_donors == ("d2@x",), repr(waiting.missing_donors))
+    check("the receiver has not spoken", not waiting.receiver_reported)
+
+    # "Complete" means everyone answered, not that everyone succeeded. A donor
+    # with nothing left reports NOTHING_ELIGIBLE, which is how a transfer ends
+    # normally -- treating that as an incomplete round would hang the session.
+    done = IT.summarize_round_reports(
+        1,
+        "s1",
+        "recv@x",
+        donors,
+        reports=[
+            report("d1@x", moved=2),
+            report("d2@x", moved=0, status=IT.STATUS_NOTHING_ELIGIBLE),
+            report("recv@x", moved=2),
+        ],
+    )
+    check("every donor answered", done.drops_complete)
+    check("the receiver answered", done.receiver_reported)
+    check("donor items are summed without the receiver's", done.dropped == 2, repr(done.dropped))
+    check("the receiver's count is read separately", done.collected == 2)
+    check("the unhappy answer is still surfaced", len(done.failures) == 1, repr(done.failures))
+
+    # Reports for another round must not satisfy this one's wait.
+    stray = IT.summarize_round_reports(2, "s1", "recv@x", donors, reports=[report("d1@x", round_id=1)])
+    check("a previous round's report does not count", stray.missing_donors == donors, repr(stray.missing_donors))
 
 
 def main() -> int:
@@ -1113,6 +1377,12 @@ def main() -> int:
     test_precheck_passes_a_sound_session()
     test_precheck_catches_each_failure()
     test_coordinator_exclusions_are_proven_only()
+    test_stack_limit_gate()
+    test_ground_pile_accounting()
+    test_stack_limit_wire_field()
+    test_report_store()
+    test_instance_cohort()
+    test_round_outcome()
 
     print("\n" + "-" * 60)
     if FAILURES:

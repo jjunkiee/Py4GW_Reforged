@@ -1,38 +1,42 @@
-"""Cross-account inventory transfer -- participant selection, policy, and dry-run preview.
+"""Cross-account inventory transfer -- participant selection, policy, preview, and the live run.
 
-Phase 4 of `docs/loot/plans/cross-account-inventory-transfer.md`. This widget is
-the review gate: it composes the shared-memory snapshot, the phase 1 planner and
-the phase 3 message vocabulary into the exact session a live run would perform,
-and then does not perform it.
+Phases 4 and 5 of `docs/loot/plans/cross-account-inventory-transfer.md`. The
+widget composes the shared-memory snapshot, the phase 1 planner and the phase 3
+message vocabulary into a session it first shows and then, on an explicit Run,
+performs.
 
-**Nothing here sends a message.** There is deliberately no `SendMessage` call in
-this file, and no `SharedCommandType` is ever handed to the transport -- the
-command names appear only as text in the message preview. Phase 5 adds run,
-abort, recall, progress and the settle warning on top of what this shows.
-
-What that buys: the slot budget, the per-donor drop counts, the leftover pile and
-the precheck verdicts are all readable before a single item leaves a bag, and the
-arithmetic behind them is proved offline in
+The preview is still the review gate and it still comes first: the slot budget,
+the per-donor drop counts, the ground piles, the leftovers and the precheck
+verdicts are all readable before a single item leaves a bag, and the arithmetic
+behind them is proved offline in
 `Examples and tests/tests/test_inventory_transfer_planner.py` rather than on the
-user's inventory.
+user's inventory. Only the Run panel sends anything.
 
-Two limitations the UI states out loud rather than hiding:
+Four things the UI states out loud rather than hiding:
 
-* The drop message carries a policy *name*, not a policy. A donor resolves that
-  name through `inventory_transfer.resolve_policy()` against its own build, so
-  the coordinator-side refinements below -- protected models, quantity floors --
-  shape this preview's budget but are not what a donor enforces. Until the
-  protocol grows a way to distribute a policy they are planning aids, not
-  protection.
-* The snapshot is up to `SHMEM_PLAYER_INVENTORY_UPDATE_THROTTLE_MS` (1.5 s)
-  stale, so the preview is a forecast. That is good enough to refuse a session
-  and never good enough to authorise one; each participant re-reads its own
-  state before acting.
+* **The coordinator is the receiver.** Run refuses unless this client is the
+  selected receiver, because the rally point is wherever this character stands
+  (plan section 11, question 1).
+* **A drop message carries a policy name, not a policy.** A donor resolves that
+  name through `inventory_transfer.resolve_wire_policy()`, so the
+  coordinator-side refinements -- protected models, quantity floors -- shape this
+  preview's budget but are not what a donor enforces. The one exception is the
+  stack limit, which is a value on the wire rather than a name, and which donors
+  do honour.
+* **Stacks move one unit per drop call**, because the native binding ignores the
+  quantity it is handed. A stack over the limit is refused whole; a stack within
+  it becomes that many ground piles and that many pickup walks. The default limit
+  is 1, which means unstacked items only.
+* **The snapshot is up to 1.5 s stale**, so the plan is a forecast. That is good
+  enough to refuse a session and never good enough to authorise one; each
+  participant re-reads its own bags before acting.
 """
 
 from dataclasses import dataclass
 from dataclasses import field
 from dataclasses import replace
+from typing import Callable
+from typing import Sequence
 from uuid import uuid4
 
 import PyImGui
@@ -47,6 +51,7 @@ from Py4GWCoreLib import ModelID
 from Py4GWCoreLib import Player
 from Py4GWCoreLib import Range
 from Py4GWCoreLib import Routines
+from Py4GWCoreLib import SharedCommandType
 from Py4GWCoreLib import ThrottledTimer
 from Py4GWCoreLib.enums import explorables
 from Py4GWCoreLib.enums import outposts
@@ -183,6 +188,610 @@ class TransferPreview:
     blocker: str = ""
 
 
+# --- live session ----------------------------------------------------------
+
+# Phase 5. Everything above this line still computes; from here down the widget
+# sends. The state machine is deliberately flat -- one phase, one deadline, one
+# thing being waited for -- because the interesting failures are all "a
+# participant never answered", and a flat machine can say which one.
+
+PHASE_IDLE = "idle"
+PHASE_SUSPENDING = "pausing donor widgets"
+PHASE_DROPPING = "waiting for donors to drop"
+PHASE_COLLECTING = "collecting the pile"
+PHASE_RECONCILING = "reconciling"
+PHASE_RESUMING = "resuming donor widgets"
+PHASE_DONE = "finished"
+
+#: Long enough for a `PauseWidgets` message to be picked up and run on every
+#: donor before the first drop is asked for. `ProcessMessages` dispatches once a
+#: frame, so this is generous rather than tight.
+SUSPEND_SETTLE_MS = 1500
+
+#: A donor's round is a walk to the rally point (the handler allows 20 s for it)
+#: plus one confirmed drop call per unit. This only has to catch a donor that
+#: never ran the handler at all.
+DROP_ROUND_TIMEOUT_MS = 60000
+
+#: The receiver walks a pile it is standing on and `LootItems` bounds its own
+#: per-item wait, so the same reasoning applies.
+COLLECT_ROUND_TIMEOUT_MS = 60000
+
+#: How often the machine looks at the world. Reports arrive through shared
+#: memory, so polling every frame would re-read it sixty times a second to watch
+#: a number that changes every few seconds.
+PHASE_POLL_MS = 250
+
+#: How long a HeroAI hold survives without being renewed. Comfortably longer than
+#: the worst-case round (a drop timeout plus a collect timeout) so a slow round
+#: cannot drop the suspension mid-flight, and short enough that a coordinator that
+#: dies outright does not strand a character unable to fight or loot for long.
+HERO_AI_HOLD_LEASE_MS = 120000
+
+#: How often the hold is renewed while a session runs. Short relative to the lease
+#: on purpose: a renewal can be swallowed by the transport if a round handler is
+#: mid-flight on that account, so the session needs several attempts inside one
+#: lease rather than one chance per round.
+HERO_AI_RENEW_INTERVAL_MS = 30000
+
+
+@dataclass(frozen=True)
+class RoundRecord:
+    """One finished round, as the progress table shows it."""
+
+    round_id: int
+    planned_items: int
+    planned_piles: int
+    dropped: int
+    collected: int
+    on_ground: int
+    note: str = ""
+
+
+class TransferSession:
+    """The live half: sends what the preview describes, one round at a time.
+
+    Ticked from the module's `update()` rather than from `draw()`. Per-frame
+    non-UI work belongs on the update callback, and it means a session keeps
+    advancing while its window is collapsed -- a transfer that stalls because
+    the user folded a header would be a memorable way to lose items.
+
+    **On suspending HeroAI.** A `TransferHoldHeroAI` lease goes to every account in
+    the receiver's instance for the whole session, and is released on every exit
+    path. Neither half of that is decoration.
+
+    *Session-scoped*, because a per-message suspension demonstrably is not enough.
+    `TransferDropItems` restores in its own `finally`, which fires the moment a
+    donor has finished dropping -- while the receiver is still walking to the pile
+    -- so the donor's `Looting` comes back on and it retakes its own drop.
+
+    *Instance-wide*, because selecting donors decides whose items move, not who can
+    interfere. A party member that is neither donor nor receiver is never sent a
+    transfer message and so never stops looting at all, and it will take the pile.
+
+    `DisableHeroAI` cannot do this job: it finishes immediately, so
+    `HealStaleHeroAISnapshot` unwinds it, and re-sending it per round would push a
+    snapshot per round onto a stack that pops exactly once. The hold is a
+    long-running handler instead, which keeps its message `Active` and therefore
+    keeps heal away, and it carries a lease so a coordinator that dies cannot
+    strand a character with HeroAI off forever.
+
+    `PauseWidgets` is separate and still sent, because it prevents a different
+    problem -- `AutoInventoryHandler` salvaging an item already queued to be
+    dropped. It goes to donors only. Sending it to this client would pause this
+    widget, which is optional, and the session would stop ticking mid-flight.
+    """
+
+    def __init__(self, read_accounts: Callable[[], tuple[AccountRow, ...]]) -> None:
+        self._read_accounts = read_accounts
+
+        self.phase: str = PHASE_IDLE
+        self.session_id: str = ""
+        self.coordinator_key: str = ""
+        self.receiver_key: str = ""
+        self.donor_keys: tuple[str, ...] = ()
+        self.policy: InventoryTransfer.TransferPolicy = InventoryTransfer.TransferPolicy()
+        self.wire_policy: str = WIRE_POLICY_NAMES[0]
+        self.pickup_radius: int = int(Range.Earshot.value)
+        self.rally: tuple[float, float] = (0.0, 0.0)
+        self.max_rounds: int = InventoryTransfer.DEFAULT_MAX_ROUNDS
+
+        self.round_id: int = 0
+        self.plan: InventoryTransfer.RoundPlan | None = None
+        self.round_donors: tuple[str, ...] = ()
+        self.history: list[RoundRecord] = []
+        self.stop_reason: str = ""
+        self.error: str = ""
+        self.leftover_on_ground: int = 0
+
+        #: Set when a finished session left a pile behind, cleared only by the
+        #: user. Leftovers must never block -- a user escaping a bad state has to
+        #: be able to -- but they must not quietly scroll away either, so this
+        #: keeps the warning and its Recall on screen until it is acknowledged.
+        self.needs_attention: bool = False
+
+        self._paused_donors: tuple[str, ...] = ()
+        #: Every account holding a HeroAI lease for this session -- the whole
+        #: instance, not just the participants. Kept so the release goes exactly
+        #: where the hold went, even if the party has changed since.
+        self._held_accounts: tuple[str, ...] = ()
+        self._stall: InventoryTransfer.StallTracker = InventoryTransfer.StallTracker()
+        self._free_before: int = 0
+        self._timer: ThrottledTimer = ThrottledTimer(SUSPEND_SETTLE_MS)
+        self._poll: ThrottledTimer = ThrottledTimer(PHASE_POLL_MS)
+        self._renew: ThrottledTimer = ThrottledTimer(HERO_AI_RENEW_INTERVAL_MS)
+        self._renew_nonce: int = 0
+
+    # -- lifecycle ----------------------------------------------------------
+
+    @property
+    def running(self) -> bool:
+        return self.phase not in (PHASE_IDLE, PHASE_DONE)
+
+    @property
+    def finished(self) -> bool:
+        return self.phase == PHASE_DONE
+
+    @property
+    def items_moved(self) -> int:
+        return sum(record.collected for record in self.history)
+
+    def _enter(self, phase: str) -> None:
+        self.phase = phase
+        self._timer.Reset()
+
+    def _elapsed(self) -> int:
+        return int(self._timer.GetTimeElapsed())
+
+    def _send(
+        self,
+        to: str,
+        command: SharedCommandType,
+        params: tuple[float, float, float, float],
+        extra: tuple[str, str, str, str],
+    ) -> bool:
+        slot = GLOBAL_CACHE.ShMem.SendMessage(self.coordinator_key, to, command, params, extra)
+        if slot == -1:
+            ConsoleLog(MODULE_NAME, "Could not send %s to %s." % (command.name, to), Console.MessageType.Error, False)
+            return False
+        return True
+
+    def start(
+        self,
+        session_id: str,
+        coordinator_key: str,
+        receiver_key: str,
+        donor_keys: Sequence[str],
+        policy: InventoryTransfer.TransferPolicy,
+        wire_policy: str,
+        pickup_radius: int,
+        rally: tuple[float, float],
+        max_rounds: int,
+        pause_donor_widgets: bool,
+    ) -> None:
+        self.session_id = session_id
+        self.coordinator_key = coordinator_key
+        self.receiver_key = receiver_key
+        self.donor_keys = tuple(donor_keys)
+        self.policy = policy
+        self.wire_policy = wire_policy
+        self.pickup_radius = pickup_radius
+        self.rally = rally
+        self.max_rounds = max_rounds
+
+        self.round_id = 0
+        self.plan = None
+        self.round_donors = ()
+        self.history = []
+        self.stop_reason = ""
+        self.error = ""
+        self.leftover_on_ground = 0
+        self.needs_attention = False
+        self._stall = InventoryTransfer.StallTracker()
+
+        # A session's reports are keyed by its own id, but an aborted predecessor
+        # that reused the id would otherwise satisfy round 1's wait instantly.
+        InventoryTransfer.clear_transfer_reports(session_id)
+
+        # Quieten the whole instance before anything is dropped. Everyone here, not
+        # just the participants: a party member nobody messaged still loots.
+        rows = self._read_accounts()
+        receiver_row = next((row for row in rows if row.key == receiver_key), None)
+        cohort: tuple[str, ...] = ()
+        if receiver_row is not None:
+            cohort = InventoryTransfer.accounts_sharing_instance(
+                receiver_row.state, [row.state for row in rows]
+            )
+        self._held_accounts = ()
+        self._renew_nonce = 0
+        self._renew.Reset()
+        self._renew_hero_ai_hold(cohort, nonce=self._renew_nonce)
+
+        self._paused_donors = ()
+        if pause_donor_widgets:
+            paused: list[str] = []
+            for key in self.donor_keys:
+                if self._send(key, SharedCommandType.PauseWidgets, (0.0, 0.0, 0.0, 0.0), ("", "", "", "")):
+                    paused.append(key)
+            self._paused_donors = tuple(paused)
+
+        ConsoleLog(
+            MODULE_NAME,
+            "Transfer %s started: %d donor(s) -> %s, policy %s, stacks up to %d."
+            % (session_id, len(self.donor_keys), receiver_key, wire_policy, policy.stack_limit),
+            Console.MessageType.Info,
+            True,
+        )
+        self._enter(PHASE_SUSPENDING)
+
+    def _renew_hero_ai_hold(self, accounts: Sequence[str], nonce: int) -> None:
+        """Take or extend the instance-wide HeroAI hold.
+
+        The nonce is the round id, and it is not decoration: `SendMessage`
+        deduplicates an identical still-pending message, so renewing with the same
+        params every round would silently reuse one slot and the lease would never
+        move. On the receiving side a repeat for a session already held extends the
+        lease rather than pushing a second snapshot.
+        """
+        held = list(self._held_accounts)
+        for key in accounts:
+            if self._send(
+                key,
+                SharedCommandType.TransferHoldHeroAI,
+                (float(nonce), float(HERO_AI_HOLD_LEASE_MS), 0.0, 0.0),
+                (self.session_id, "", "", ""),
+            ):
+                if key not in held:
+                    held.append(key)
+        self._held_accounts = tuple(held)
+
+    def _release_hero_ai_hold(self) -> None:
+        """Give every held account its HeroAI back. Safe to call more than once."""
+        for key in self._held_accounts:
+            self._send(
+                key,
+                SharedCommandType.TransferReleaseHeroAI,
+                (0.0, 0.0, 0.0, 0.0),
+                (self.session_id, "", "", ""),
+            )
+        self._held_accounts = ()
+
+    def abort(self, reason: str = "aborted by the user") -> None:
+        if not self.running:
+            return
+        ConsoleLog(MODULE_NAME, "Transfer aborted: %s." % reason, Console.MessageType.Warning, True)
+        self._finish(reason)
+
+    def _fail(self, reason: str) -> None:
+        self.error = reason
+        ConsoleLog(MODULE_NAME, "Transfer failed: %s." % reason, Console.MessageType.Error, True)
+        self._finish(reason)
+
+    def _finish(self, reason: str) -> None:
+        """Every exit runs through here, so the resume can never be skipped."""
+        self.stop_reason = reason
+        self.leftover_on_ground = self._ground_count()
+        self._enter(PHASE_RESUMING)
+
+    def _ground_count(self) -> int:
+        """Items still collectable at the rally point. Counts, never collects."""
+        try:
+            return len(
+                Routines.Yield.Items.GetGroundItemIds(
+                    radius=float(self.pickup_radius or Range.Earshot.value),
+                    center=self.rally,
+                )
+            )
+        except Exception as exc:
+            ConsoleLog(MODULE_NAME, "Could not count ground items: %s" % exc, Console.MessageType.Warning, False)
+            return 0
+
+    # -- the machine --------------------------------------------------------
+
+    def tick(self) -> None:
+        if not self.running:
+            return
+
+        # Renewed on a clock rather than only per round, because a round can outlast
+        # the gap between renewals and because any single renewal may be swallowed by
+        # the transport while a handler is running on that account.
+        if self._renew.IsExpired():
+            self._renew.Reset()
+            self._renew_nonce += 1
+            self._renew_hero_ai_hold(self._held_accounts, nonce=self._renew_nonce)
+
+        if not self._poll.IsExpired():
+            return
+        self._poll.Reset()
+
+        try:
+            if self.phase == PHASE_SUSPENDING:
+                if self._elapsed() >= SUSPEND_SETTLE_MS:
+                    self._begin_round()
+            elif self.phase == PHASE_DROPPING:
+                self._await_drops()
+            elif self.phase == PHASE_COLLECTING:
+                self._await_collect()
+            elif self.phase == PHASE_RECONCILING:
+                self._reconcile()
+            elif self.phase == PHASE_RESUMING:
+                self._resume()
+        except Exception as exc:
+            # A raised tick must still put the donors back, so this routes through
+            # the resume rather than stopping where it stands.
+            if self.phase == PHASE_RESUMING:
+                self._enter(PHASE_DONE)
+                self.error = str(exc)
+            else:
+                self._fail(str(exc))
+
+    def _begin_round(self) -> None:
+        self.round_id += 1
+        if self.round_id > self.max_rounds:
+            self._finish(InventoryTransfer.STOP_ROUND_LIMIT)
+            return
+
+        rows = {row.key: row for row in self._read_accounts()}
+        receiver_row = rows.get(self.receiver_key)
+        if receiver_row is None:
+            self._fail("the receiver stopped publishing to shared memory")
+            return
+
+        donors = [rows[key].state.as_donor() for key in self.donor_keys if key in rows]
+        if not donors:
+            self._finish("no donor is still reachable")
+            return
+
+        # The snapshot supplies the receiver's stack contents, which is all the
+        # merge arithmetic needs; the free-slot count comes from a live local read
+        # because that is the whole round budget and the snapshot lags by 1.5 s.
+        # This client is the receiver, so the authoritative read is available.
+        projection = InventoryTransfer.ReceiverProjection.from_snapshot(receiver_row.state.inventory)
+        self._free_before = int(GLOBAL_CACHE.Inventory.GetFreeSlotCount())
+        projection.free_slots = self._free_before
+
+        plan = InventoryTransfer.plan_round(self.round_id, projection, donors, self.policy)
+        if plan.item_count == 0:
+            usable = self._free_before - max(self.policy.safety_margin, 0)
+            self._finish(
+                InventoryTransfer.STOP_RECEIVER_FULL if usable <= 0 else InventoryTransfer.STOP_DONORS_EXHAUSTED
+            )
+            return
+
+        self.plan = plan
+        InventoryTransfer.clear_transfer_reports(self.session_id, self.round_id)
+
+        # Renew before asking anyone to drop, on top of the clock in `tick`. Cheap, and
+        # it puts a fresh lease in place at exactly the moment a round is about to spend
+        # the longest stretch without another chance to renew.
+        self._renew.Reset()
+        self._renew_nonce += 1
+        self._renew_hero_ai_hold(self._held_accounts, nonce=self._renew_nonce)
+
+        rally_x, rally_y = self.rally
+        stack_field = InventoryTransfer.format_stack_limit(self.policy.stack_limit)
+
+        # Only donors the transport accepted. Waiting on a donor whose message was
+        # never queued would cost the round its whole timeout to learn nothing.
+        asked: list[str] = []
+        for donor_key in plan.donor_keys:
+            if self._send(
+                donor_key,
+                SharedCommandType.TransferDropItems,
+                (float(self.round_id), float(plan.budget_for(donor_key)), float(rally_x), float(rally_y)),
+                (self.wire_policy, self.session_id, stack_field, ""),
+            ):
+                asked.append(donor_key)
+        self.round_donors = tuple(asked)
+
+        if not asked:
+            self._fail("no donor could be reached")
+            return
+
+        ConsoleLog(
+            MODULE_NAME,
+            "Round %d: asked %d donor(s) for %d item(s), expecting %d ground pile(s)."
+            % (self.round_id, len(asked), plan.item_count, plan.ground_item_count),
+            Console.MessageType.Info,
+            True,
+        )
+        self._enter(PHASE_DROPPING)
+
+    def _outcome(self) -> InventoryTransfer.RoundOutcome:
+        return InventoryTransfer.summarize_round_reports(
+            self.round_id, self.session_id, self.receiver_key, self.round_donors
+        )
+
+    def _await_drops(self) -> None:
+        outcome = self._outcome()
+        timed_out = self._elapsed() >= DROP_ROUND_TIMEOUT_MS
+        if not outcome.drops_complete and not timed_out:
+            return
+
+        if timed_out and not outcome.drops_complete:
+            # Collect anyway. Whatever did reach the floor is better collected than
+            # left, and a donor that answers late simply contributes to a later
+            # round or to the leftover count.
+            ConsoleLog(
+                MODULE_NAME,
+                "Round %d: no answer from %s; collecting what is on the ground."
+                % (self.round_id, ", ".join(outcome.missing_donors)),
+                Console.MessageType.Warning,
+                True,
+            )
+
+        # Every donor answered, none of them dropped anything, and the floor is
+        # clean. That is how a transfer ends normally -- the donors have nothing
+        # eligible left -- so skip the walk rather than suspending this client's
+        # HeroAI to collect an empty patch of ground.
+        if outcome.drops_complete and outcome.dropped == 0 and self._ground_count() == 0:
+            self._enter(PHASE_RECONCILING)
+            return
+
+        plan = self.plan
+        budget = plan.ground_item_count if plan is not None else 0
+        self._send(
+            self.receiver_key,
+            SharedCommandType.TransferPickUpItems,
+            (float(self.round_id), float(budget), float(self.pickup_radius), 0.0),
+            (self.session_id, "", "", ""),
+        )
+        self._enter(PHASE_COLLECTING)
+
+    def _await_collect(self) -> None:
+        outcome = self._outcome()
+        if not outcome.receiver_reported and self._elapsed() < COLLECT_ROUND_TIMEOUT_MS:
+            return
+        if not outcome.receiver_reported:
+            ConsoleLog(
+                MODULE_NAME,
+                "Round %d: the receiver never reported; reconciling from the ground instead."
+                % self.round_id,
+                Console.MessageType.Warning,
+                True,
+            )
+        self._enter(PHASE_RECONCILING)
+
+    def _reconcile(self) -> None:
+        plan = self.plan
+        if plan is None:
+            self._fail("a round finished without a plan")
+            return
+
+        outcome = self._outcome()
+        dropped_by_donor = {
+            entry.reporter_email: entry.items_moved
+            for entry in outcome.reports
+            if entry.reporter_email in self.round_donors
+        }
+        free_after = int(GLOBAL_CACHE.Inventory.GetFreeSlotCount())
+        on_ground = self._ground_count()
+
+        report = InventoryTransfer.reconcile_round(
+            plan,
+            dropped_by_donor,
+            self._free_before,
+            free_after,
+            on_ground,
+            tracker=self._stall,
+            # Piles the receiver actually took, which is the honest "did this round
+            # move anything" signal: a collected item that merged into an existing
+            # stack costs no slot at all, and the free-slot delta would call that
+            # round empty and stall the session on a transfer that is working.
+            collected_items=outcome.collected,
+        )
+
+        note = ""
+        failures = [entry for entry in outcome.failures if entry.status != InventoryTransfer.STATUS_NOTHING_ELIGIBLE]
+        if failures:
+            note = "; ".join("%s: %s" % (entry.reporter_email, entry.status_text) for entry in failures)
+
+        self.history.append(
+            RoundRecord(
+                round_id=self.round_id,
+                planned_items=plan.item_count,
+                planned_piles=plan.ground_item_count,
+                dropped=report.dropped_items,
+                collected=outcome.collected,
+                on_ground=on_ground,
+                note=note,
+            )
+        )
+        InventoryTransfer.clear_transfer_reports(self.session_id, self.round_id)
+
+        receiver_entry = outcome.receiver_report
+        if receiver_entry is not None and receiver_entry.status == InventoryTransfer.STATUS_INVENTORY_FULL:
+            self._finish(InventoryTransfer.STOP_RECEIVER_FULL)
+            return
+        if report.stalled:
+            self._finish(InventoryTransfer.STOP_STALLED)
+            return
+
+        self._begin_round()
+
+    def _resume(self) -> None:
+        # Counted while the instance is still quiet, and before anything is handed
+        # back. Recounted rather than trusting the count taken at `_finish` because a
+        # donor that answered late may have dropped in between; taken *first* because
+        # the moment HeroAI comes back the party starts eating the evidence.
+        self.leftover_on_ground = self._ground_count()
+        self.needs_attention = self.leftover_on_ground > 0
+
+        # Released even when there are leftovers. Holding the suspension open until a
+        # user acknowledges a warning is the one thing this must never do -- "warn,
+        # never block" -- and Recall still works afterwards, because the pickup
+        # handler suspends HeroAI around its own collect.
+        self._release_hero_ai_hold()
+
+        for key in self._paused_donors:
+            self._send(key, SharedCommandType.ResumeWidgets, (0.0, 0.0, 0.0, 0.0), ("", "", "", ""))
+        self._paused_donors = ()
+
+        ConsoleLog(
+            MODULE_NAME,
+            "Transfer %s finished after %d round(s): %d item(s) collected, %d left on the ground (%s)."
+            % (self.session_id, len(self.history), self.items_moved, self.leftover_on_ground, self.stop_reason),
+            Console.MessageType.Info,
+            True,
+        )
+        self._enter(PHASE_DONE)
+
+    # -- recovery -----------------------------------------------------------
+
+    def resume_donors(self) -> None:
+        """Manual escape hatch: hand HeroAI and widgets back without a running session.
+
+        A session that died with this widget disabled, or a client restarted
+        mid-transfer, leaves accounts suspended with nothing left to release them.
+        The lease expires on its own eventually; this is the button for someone who
+        does not want to wait for it. Cheap to send and harmless when unneeded.
+
+        Sent to everyone this session ever held, not just the donors, because the
+        hold covers the whole instance.
+        """
+        for key in set(self._held_accounts) | set(self.donor_keys or ()) | {self.receiver_key}:
+            if not key:
+                continue
+            # Empty session id: release whatever is held there. Someone reaching for
+            # this button does not know which session stranded them, and should not
+            # have to.
+            self._send(
+                key,
+                SharedCommandType.TransferReleaseHeroAI,
+                (0.0, 0.0, 0.0, 0.0),
+                ("", "", "", ""),
+            )
+            self._send(key, SharedCommandType.ResumeWidgets, (0.0, 0.0, 0.0, 0.0), ("", "", "", ""))
+        self._held_accounts = ()
+        self._paused_donors = ()
+
+    def recall(self) -> int:
+        """Ask the donors to retake what is still on the floor.
+
+        Sent to donors rather than to the receiver on purpose: the receiver either
+        could not take these items or ran out of room, so asking it again is the
+        one thing certain not to help. A donor may retake its own drop (verified
+        live), and `LootGroundItems` includes items still reserved for the caller,
+        which is exactly that case.
+
+        Each donor collects around wherever it is standing, because the handler
+        uses its own position as the centre. That is the rally point as long as
+        nothing walked it away, which is the normal state right after a round.
+        """
+        sent = 0
+        recall_round = self.round_id + 1000  # never collides with a real round id
+        for key in self.donor_keys:
+            if self._send(
+                key,
+                SharedCommandType.TransferPickUpItems,
+                (float(recall_round), 0.0, float(self.pickup_radius), 0.0),
+                (self.session_id, "", "", ""),
+            ):
+                sent += 1
+        ConsoleLog(MODULE_NAME, "Recall sent to %d donor(s)." % sent, Console.MessageType.Info, True)
+        return sent
+
+
 class InventoryTransferWidget:
     """Session state for the dry run. Owns nothing the game can observe."""
 
@@ -198,6 +807,8 @@ class InventoryTransferWidget:
         self._safety_margin: int = 1
         self._max_rounds: int = InventoryTransfer.DEFAULT_MAX_ROUNDS
         self._pickup_radius: int = int(Range.Earshot.value)
+        self._max_stack: int = InventoryTransfer.DEFAULT_MAX_STACK_QUANTITY
+        self._pause_donor_widgets: bool = True
         self._protected_text: str = ""
         self._floors_text: str = ""
 
@@ -205,6 +816,8 @@ class InventoryTransferWidget:
         self._preview: TransferPreview = TransferPreview()
         self._refresh_timer: ThrottledTimer = ThrottledTimer(REFRESH_INTERVAL_MS)
         self._dirty: bool = True
+
+        self._session: TransferSession = TransferSession(self._read_accounts)
 
     # -- persistence --------------------------------------------------------
 
@@ -227,6 +840,9 @@ class InventoryTransferWidget:
         stored_rounds = cfg.get_int(SECTION_POLICY, "max_rounds", InventoryTransfer.DEFAULT_MAX_ROUNDS)
         self._max_rounds = max(1, min(int(stored_rounds), 64))
         self._pickup_radius = max(0, int(cfg.get_int(SECTION_POLICY, "pickup_radius", int(Range.Earshot.value))))
+        stored_stack = cfg.get_int(SECTION_POLICY, "max_stack", InventoryTransfer.DEFAULT_MAX_STACK_QUANTITY)
+        self._max_stack = max(1, min(int(stored_stack), InventoryTransfer.MAX_STACK_QUANTITY))
+        self._pause_donor_widgets = bool(cfg.get_bool(SECTION_POLICY, "pause_donor_widgets", True))
         self._protected_text = cfg.get_str(SECTION_POLICY, "protected_models", "")
         self._floors_text = cfg.get_str(SECTION_POLICY, "model_floors", "")
 
@@ -240,6 +856,8 @@ class InventoryTransferWidget:
         cfg.set(SECTION_POLICY, "safety_margin", self._safety_margin)
         cfg.set(SECTION_POLICY, "max_rounds", self._max_rounds)
         cfg.set(SECTION_POLICY, "pickup_radius", self._pickup_radius)
+        cfg.set(SECTION_POLICY, "max_stack", self._max_stack)
+        cfg.set(SECTION_POLICY, "pause_donor_widgets", self._pause_donor_widgets)
         cfg.set(SECTION_POLICY, "protected_models", self._protected_text)
         cfg.set(SECTION_POLICY, "model_floors", self._floors_text)
         self._dirty = True
@@ -249,11 +867,16 @@ class InventoryTransferWidget:
     def _policy(self) -> InventoryTransfer.TransferPolicy:
         """The policy this preview budgets with.
 
-        The wire policy is the part a donor honours; the rest is coordinator-side
-        and is labelled as such in the UI. `safety_margin` is honestly local --
-        it shapes the budget and never crosses the wire at all.
+        Built through `resolve_wire_policy` from exactly what the drop message
+        will carry -- the policy name and the stack limit field -- so the preview
+        cannot budget against rules the donor will not apply. The fields added on
+        top are coordinator-side and are labelled as such in the UI:
+        `safety_margin` shapes the budget and never crosses the wire, and the
+        protected models and floors have no room on it.
         """
-        base = InventoryTransfer.resolve_policy(self._wire_policy)
+        base = InventoryTransfer.resolve_wire_policy(
+            self._wire_policy, InventoryTransfer.format_stack_limit(self._max_stack)
+        )
         return replace(
             base,
             safety_margin=self._safety_margin,
@@ -383,6 +1006,51 @@ class InventoryTransferWidget:
             self._donor_keys.remove(key)
         self._store(cfg)
 
+    # -- live session -------------------------------------------------------
+
+    def tick(self) -> None:
+        """Advance a running transfer. Called from the module's `update()`."""
+        self._session.tick()
+
+    def _blocked_reason(self) -> str:
+        """Why Run is refused, or an empty string when it is allowed."""
+        if self._session.running:
+            return "a transfer is already running"
+
+        preview = self._preview
+        if preview.session is None or not preview.prechecks:
+            return preview.blocker or "there is no plan yet"
+        if not InventoryTransfer.precheck_passed(preview.prechecks):
+            return "the precheck has not passed"
+        if preview.session.item_count == 0:
+            return "the plan would move nothing"
+
+        receiver = next((row for row in preview.rows if row.key == self._receiver_key), None)
+        if receiver is None:
+            return "the receiver is not publishing to shared memory"
+        if not receiver.is_local:
+            # Pinned deliberately (plan section 11, question 1). A free-floating
+            # coordinator bought a second set of states and a second way for the
+            # rally point to be wrong, and paid for neither.
+            return "the receiver must be this client: the rally point is where this character stands"
+        return ""
+
+    def _start_session(self) -> None:
+        donors = [key for key in self._donor_keys if any(row.key == key for row in self._preview.rows)]
+        self._session_id = uuid4().hex[:8]
+        self._session.start(
+            session_id=self._session_id,
+            coordinator_key=str(Player.GetAccountEmail() or ""),
+            receiver_key=self._receiver_key,
+            donor_keys=donors,
+            policy=self._policy(),
+            wire_policy=self._wire_policy,
+            pickup_radius=self._pickup_radius,
+            rally=Player.GetXY(),
+            max_rounds=self._max_rounds,
+            pause_donor_widgets=self._pause_donor_widgets,
+        )
+
     # -- drawing ------------------------------------------------------------
 
     def draw(self) -> None:
@@ -402,15 +1070,24 @@ class InventoryTransferWidget:
                 self._draw_policy(cfg)
             if PyImGui.collapsing_header("Precheck", HEADER_FLAGS):
                 self._draw_precheck()
+            if PyImGui.collapsing_header("Run", HEADER_FLAGS):
+                self._draw_run()
             if PyImGui.collapsing_header("Preview", HEADER_FLAGS):
                 self._draw_preview()
         ImGui.End(self._ini_key)
 
     def _draw_header(self) -> None:
-        PyImGui.text_colored("Dry run only: this widget never sends a message.", COLOR_TITLE)
+        if self._session.running:
+            PyImGui.text_colored(
+                "Transfer running -- round %d, %s." % (self._session.round_id, self._session.phase),
+                COLOR_WARN,
+            )
+        else:
+            PyImGui.text_colored("Everything below the Run panel is a forecast, not a receipt.", COLOR_TITLE)
         PyImGui.text_wrapped(
-            "Everything below is computed from the shared-memory snapshot, which lags live inventories "
-            "by up to 1.5 seconds. Treat it as a forecast, not a receipt."
+            "The plan is computed from the shared-memory snapshot, which lags live inventories by up to "
+            "1.5 seconds. Only the Run panel sends anything; each participant re-reads its own bags "
+            "before acting on what it is asked to do."
         )
         PyImGui.separator()
         PyImGui.text("Session id: %s" % self._session_id)
@@ -560,6 +1237,48 @@ class InventoryTransferWidget:
         )
 
         PyImGui.separator()
+        PyImGui.text_colored("Stacks", COLOR_TITLE)
+
+        stack = PyImGui.input_int("Largest stack to move##inventory_transfer_stack", self._max_stack)
+        stack = max(1, min(stack, InventoryTransfer.MAX_STACK_QUANTITY))
+        if stack != self._max_stack:
+            self._max_stack = stack
+            self._store(cfg)
+
+        if self._max_stack <= 1:
+            PyImGui.text_colored("Unstacked items only. Any stack of two or more stays put.", COLOR_MUTED)
+        else:
+            PyImGui.text_colored(
+                "A stack of %d costs %d drop call(s) and lands as %d separate ground pile(s)."
+                % (self._max_stack, self._max_stack, self._max_stack),
+                COLOR_WARN,
+            )
+        PyImGui.text_wrapped(
+            "The native drop binding moves one unit per call whatever quantity it is given, so a stack "
+            "has to be dropped one item at a time. A donor refuses any stack over this limit whole and "
+            "untouched rather than starting one it cannot finish. This is the one policy value that "
+            "does reach the donors."
+        )
+
+        PyImGui.separator()
+        PyImGui.text_colored("Live run", COLOR_TITLE)
+
+        pause = PyImGui.checkbox("Pause optional widgets on donors##inventory_transfer_pause", self._pause_donor_widgets)
+        if pause != self._pause_donor_widgets:
+            self._pause_donor_widgets = pause
+            self._store(cfg)
+        PyImGui.text_colored(
+            "Keeps AutoInventoryHandler and LootEx from salvaging or depositing an item already queued "
+            "to be dropped. Donors only -- pausing this client would stop the session mid-flight.",
+            COLOR_MUTED,
+        )
+        PyImGui.text_wrapped(
+            "Hero AI is suspended for the whole run on every account in this instance, not just the "
+            "donors: a party member nobody selected still loots, and would race you to the pile. It is "
+            "restored when the run ends, aborts or fails, and lapses on its own if this client dies."
+        )
+
+        PyImGui.separator()
         PyImGui.text_colored("Preview-only refinements", COLOR_TITLE)
         PyImGui.text_wrapped(
             "A drop message carries a policy name, not a policy. These two lists change the budget this "
@@ -628,6 +1347,127 @@ class InventoryTransferWidget:
 
         PyImGui.end_table()
 
+    def _draw_run(self) -> None:
+        """The one panel in this widget that puts messages on the wire."""
+        session = self._session
+        blocked = self._blocked_reason()
+
+        if session.running:
+            PyImGui.text_colored("Round %d -- %s" % (session.round_id, session.phase), COLOR_TITLE)
+        elif session.finished:
+            colour = COLOR_FAIL if session.error else COLOR_OK
+            PyImGui.text_colored(
+                "Finished after %d round(s): %d item(s) collected. Stopped because %s."
+                % (len(session.history), session.items_moved, session.stop_reason or "the plan ran out"),
+                colour,
+            )
+        else:
+            PyImGui.text_colored("Idle.", COLOR_MUTED)
+
+        PyImGui.begin_disabled(bool(blocked))
+        if PyImGui.button("Run transfer##inventory_transfer_run"):
+            self._start_session()
+        PyImGui.end_disabled()
+
+        PyImGui.same_line(0, 8)
+        PyImGui.begin_disabled(not session.running)
+        if PyImGui.button("Abort##inventory_transfer_abort"):
+            session.abort()
+        PyImGui.end_disabled()
+
+        PyImGui.same_line(0, 8)
+        if PyImGui.button("Force restore hero AI##inventory_transfer_resume_donors"):
+            # Escape hatch for a session that died with this widget disabled, or a
+            # client restarted mid-transfer: the lease would expire eventually, and
+            # this is for someone who does not want to wait for it.
+            session.resume_donors()
+
+        if blocked:
+            PyImGui.text_colored("Cannot run: %s." % blocked, COLOR_WARN)
+        elif not session.running:
+            plan = self._preview.session
+            first = plan.rounds[0] if plan is not None and plan.rounds else None
+            if first is not None:
+                PyImGui.text_wrapped(
+                    "Ready: %d donor(s) will drop %d item(s) as %d ground pile(s) at this character's "
+                    "position, under policy '%s' with stacks up to %d."
+                    % (
+                        len(first.donor_keys),
+                        first.item_count,
+                        first.ground_item_count,
+                        self._wire_policy,
+                        self._max_stack,
+                    )
+                )
+
+        PyImGui.text_colored(
+            "Donors enforce the wire policy and the stack limit from their own live bag read. The "
+            "protected models and quantity floors below shape this preview only.",
+            COLOR_MUTED,
+        )
+
+        if session.error:
+            PyImGui.text_colored("Error: %s" % session.error, COLOR_FAIL)
+
+        if session.needs_attention:
+            PyImGui.separator()
+            PyImGui.text_colored(
+                "%d item(s) are still on the ground at the rally point." % session.leftover_on_ground,
+                COLOR_FAIL,
+            )
+            PyImGui.text_wrapped(
+                "They will die with the instance if nobody takes them. Recall asks each donor to collect "
+                "what is at its feet, which works while the donors are still standing at the rally point. "
+                "Walking this character over the pile also works."
+            )
+            if PyImGui.button("Recall to donors##inventory_transfer_recall"):
+                session.recall()
+            PyImGui.same_line(0, 8)
+            if PyImGui.button("Dismiss##inventory_transfer_dismiss"):
+                session.needs_attention = False
+
+        if session.history:
+            self._draw_progress(session)
+
+    def _draw_progress(self, session: TransferSession) -> None:
+        PyImGui.separator()
+        PyImGui.text_colored("Rounds run", COLOR_TITLE)
+
+        if not PyImGui.begin_table("##inventory_transfer_progress", 6, TABLE_FLAGS):
+            return
+
+        PyImGui.table_setup_column("Round")
+        PyImGui.table_setup_column("Planned")
+        PyImGui.table_setup_column("Piles")
+        PyImGui.table_setup_column("Dropped")
+        PyImGui.table_setup_column("Collected")
+        PyImGui.table_setup_column("Left")
+        PyImGui.table_headers_row()
+
+        for record in session.history[-MAX_LIST_ROWS:]:
+            PyImGui.table_next_row()
+            PyImGui.table_set_column_index(0)
+            PyImGui.text(str(record.round_id))
+            PyImGui.table_set_column_index(1)
+            PyImGui.text(str(record.planned_items))
+            PyImGui.table_set_column_index(2)
+            PyImGui.text(str(record.planned_piles))
+            PyImGui.table_set_column_index(3)
+            PyImGui.text(str(record.dropped))
+            PyImGui.table_set_column_index(4)
+            PyImGui.text(str(record.collected))
+            PyImGui.table_set_column_index(5)
+            if record.on_ground:
+                PyImGui.text_colored(str(record.on_ground), COLOR_WARN)
+            else:
+                PyImGui.text("0")
+
+        PyImGui.end_table()
+
+        notes = [record for record in session.history if record.note]
+        for record in notes[-MAX_LIST_ROWS:]:
+            PyImGui.text_colored("Round %d: %s" % (record.round_id, record.note), COLOR_WARN)
+
     def _draw_preview(self) -> None:
         session = self._preview.session
         if session is None:
@@ -635,9 +1475,17 @@ class InventoryTransferWidget:
             return
 
         slots = sum(plan.slots_committed for plan in session.rounds)
+        piles = sum(plan.ground_item_count for plan in session.rounds)
         PyImGui.text(
-            "%d round(s), %d item(s), %d receiver slot(s)." % (session.round_count, session.item_count, slots)
+            "%d round(s), %d item(s), %d ground pile(s), %d receiver slot(s)."
+            % (session.round_count, session.item_count, piles, slots)
         )
+        if piles > session.item_count:
+            PyImGui.text_colored(
+                "More piles than items: a stack is dropped one unit at a time, and each unit is its own "
+                "pile for the receiver to walk to.",
+                COLOR_MUTED,
+            )
         PyImGui.text_colored("Stops because: %s." % session.stop_reason, COLOR_MUTED)
 
         if session.item_count == 0:
@@ -662,7 +1510,7 @@ class InventoryTransferWidget:
             return
 
         PyImGui.separator()
-        PyImGui.text_colored("Round 1 messages (not sent)", COLOR_TITLE)
+        PyImGui.text_colored("Round 1 messages, exactly as Run would send them", COLOR_TITLE)
 
         first = session.rounds[0]
         rally_x, rally_y = self._preview.rally
@@ -687,7 +1535,14 @@ class InventoryTransferWidget:
                 "(%d, %d, %.0f, %.0f)" % (first.round_id, first.budget_for(donor_key), rally_x, rally_y)
             )
             PyImGui.table_set_column_index(3)
-            PyImGui.text('("%s", "%s", "", "")' % (self._wire_policy, self._session_id))
+            PyImGui.text(
+                '("%s", "%s", "%s", "")'
+                % (
+                    self._wire_policy,
+                    self._session_id,
+                    InventoryTransfer.format_stack_limit(self._max_stack),
+                )
+            )
 
         PyImGui.table_next_row()
         PyImGui.table_set_column_index(0)
@@ -695,7 +1550,10 @@ class InventoryTransferWidget:
         PyImGui.table_set_column_index(1)
         PyImGui.text("TransferPickUpItems")
         PyImGui.table_set_column_index(2)
-        PyImGui.text("(%d, %d, %d, 0)" % (first.round_id, first.item_count, self._pickup_radius))
+        # Ground piles, not planned items: a stack of three is dropped one unit at
+        # a time and lands as three piles, and a budget in items would tell the
+        # receiver to collect one of them and walk away.
+        PyImGui.text("(%d, %d, %d, 0)" % (first.round_id, first.ground_item_count, self._pickup_radius))
         PyImGui.table_set_column_index(3)
         PyImGui.text('("%s", "", "", "")' % self._session_id)
 
@@ -819,6 +1677,21 @@ class InventoryTransferWidget:
 WIDGET_INSTANCE = InventoryTransferWidget()
 
 
+def update() -> None:
+    """Per-frame non-UI callback: advances a running transfer.
+
+    Separate from `main()` on purpose. A session that only ticked while its
+    window was drawn would stall the moment the user collapsed the widget --
+    halfway through a round, with items on the ground and donor widgets paused.
+    """
+    try:
+        if not Routines.Checks.Map.MapValid():
+            return
+        WIDGET_INSTANCE.tick()
+    except Exception as exc:
+        ConsoleLog(MODULE_NAME, "Session tick failed: %s" % exc, Console.MessageType.Error, False)
+
+
 def main() -> None:
     """Per-frame UI callback."""
     try:
@@ -837,16 +1710,16 @@ def tooltip() -> None:
     PyImGui.spacing()
     PyImGui.separator()
     PyImGui.text_wrapped(
-        "Plans a drop-and-collect item ferry between multiboxed accounts: donors drop whole stacks at a "
-        "rally point and one receiver walks the pile. This is the dry-run half."
+        "Runs a drop-and-collect item ferry between multiboxed accounts: donors drop at a rally point "
+        "and this character walks the pile. Plans the whole session first, then runs it round by round."
     )
     PyImGui.spacing()
     PyImGui.text_colored("Features:", COLOR_TITLE)
     PyImGui.bullet_text("Receiver picker and donor selection across every account in shared memory.")
-    PyImGui.bullet_text("Named wire policy plus coordinator-side budget settings.")
+    PyImGui.bullet_text("Named wire policy, a stack limit the donors honour, and budget settings.")
     PyImGui.bullet_text("Precheck panel reporting each session condition separately.")
     PyImGui.bullet_text("Round-by-round preview, the exact round 1 messages, leftovers and exclusions.")
-    PyImGui.bullet_text("Sends nothing: no message leaves this client.")
+    PyImGui.bullet_text("Live run with abort, per-round progress, and Recall for anything left behind.")
     PyImGui.end_tooltip()
 
 

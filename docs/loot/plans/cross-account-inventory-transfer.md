@@ -1,16 +1,58 @@
 # Cross-Account Inventory Transfer (Drop-and-Collect Ferry)
 
-**Status:** Phases 1-4 of section 8 (planner, offline tests, yield helpers,
-enum, message handlers, dry-run widget) are implemented; phases 5-6 are still
-proposed. A widget now composes the whole session and shows it -- participants,
-policy, precheck, per-round plan, the exact round 1 messages, leftovers and
-exclusions -- but it sends nothing. Actually moving an item is still a manual,
-one-round-at-a-time exercise driven by hand from the Messaging window's
-send-message section, with no rally, no reconciliation, and no settle warning.
-Every game-behavior claim marked *inferred* below remains unverified against a
-live injected client and must be confirmed before the corresponding code is
-trusted. The planner encodes those assumptions as constants and defaults to the
-conservative branch, so it is arithmetically proven and behaviorally unproven.
+**Status:** Phases 1-5 of section 8 (planner, offline tests, yield helpers,
+enum, message handlers, widget preview, and the live run) are implemented; phase
+6 is still proposed. The widget now composes the whole session, shows it, and on
+an explicit Run performs it round by round with abort, per-round progress, a
+leftover warning and Recall. The first live run of the phase 5 machine, on
+2026-09-07, **found the suspension defect described in section 6.8**: the whole
+party fought over the drops, because a per-message suspension ends while the
+receiver is still walking and because bystanders were never suspended at all.
+The first fix for that -- a leased, instance-wide `TransferHoldHeroAI` held open
+by a long-running handler -- was itself defeated by the transport, and the second
+live run exposed why: **`SendMessage` silently drops any message to an account
+that already has a running message from the same sender**, for a full 60 seconds.
+Section 6.9 records that constraint, which applies to every multibox feature in
+this repository and is the more valuable finding. The hold is now a per-frame
+sweeper, and both round handlers finish their message before reporting. None of
+that has been run live yet.
+
+**The stack defect is now bounded rather than open.** A1 is disproved: the
+native binding drops one unit per call. Rather than pretend otherwise, the
+planner refuses any stack over `TransferPolicy.max_stack_quantity`, which
+defaults to **1** -- unstacked items only -- and a donor refuses an oversized
+stack *whole and untouched* rather than starting one it cannot finish. Raising
+the limit makes a stack move by repeated single drops, at one drop call, one
+ground pile and one pickup walk per unit. See section 4.1.
+
+**Phase 5 landed:** the live session in
+`Widgets/Guild Wars/Items & Loot/InventoryTransfer.py`, plus the stack limit and
+the round-report vocabulary it needed in the phase 1 planner. The widget grew a
+Run panel, a `update()` callback that ticks the session while the window is
+collapsed, per-round progress, Abort, Recall, a dismissable leftover warning, and
+a manual "resume donor widgets" escape hatch. The offline fixture now runs 244
+checks, all passing. Pyright: planner and fixture clean at the project
+configuration and at `strict`; the widget clean at the project configuration and
+carrying five `strict` diagnostics, all upstream `Py4GWCoreLib` typing gaps in
+surfaces it merely calls (`ConsoleLog`, `Color.to_tuple_normalized`,
+`ImGui.Begin`, and now `ShMem.SendMessage`, whose `params` is a bare `tuple`);
+`Messaging.py` reports the same sixteen pre-existing errors as the committed
+file and no new diagnostic.
+
+Four decisions phase 5 made that the plan did not anticipate, all recorded in
+section 6.8 because each reverses or refines something written earlier:
+
+1. **HeroAI is held for the whole session on every account in the instance**, by
+   a new leased `TransferHoldHeroAI` / `TransferReleaseHeroAI` pair. Section
+   6.2's proposed answer does not survive the strict-stack semantics of
+   `hero_ai_snapshots`, and the first replacement did not survive a live run.
+2. **The stall guard reads the receiver's report, not its free-slot delta**, so
+   a round that merged everything into existing stacks is not mistaken for a
+   round that moved nothing.
+3. **The round report store moved into the planner module**, because the widget
+   and the message handler both need it and widgets cannot import each other.
+4. **The pickup budget counts ground piles, not items**, which is what a stack
+   dropped one unit at a time actually produces.
 
 **Phase 1 landed:** `Py4GWCoreLib/py4gwcorelib_src/inventory_transfer.py` and
 `Examples and tests/tests/test_inventory_transfer_planner.py` (96 checks, all
@@ -403,14 +445,50 @@ What this leaves working, and what it does not:
 - **Non-stackable items ferry correctly.** Weapons, trophies, armor, kits, dyes:
   one item, one slot, one drop. Every live run above that moved a
   non-stackable behaved as designed.
-- **Stacks do not move.** A round that selects a stack drops one unit of it and
-  leaves the rest. `Items.DropItems` no longer counts that as a successful drop
-  -- a partial drop means the caller budgeted a whole stack and the stack is
-  still in the bags -- so a stack-only round reports zero items moved and
-  `STATUS_ERROR` rather than claiming a delivery it did not make. The one unit
-  already on the ground is recoverable with Recall.
+- **Stacks are refused rather than half-moved.** See section 4.1: the transfer
+  now declines any stack larger than a configurable limit instead of dropping one
+  unit and orphaning it.
 - The quantity is still passed on every drop, so this path becomes correct with
   no change here the moment the native binding honors it.
+
+### 4.1 The stack limit (the A1 workaround)
+
+A1 cannot be fixed from Python, so it is bounded from Python. The rule is one
+number, `TransferPolicy.max_stack_quantity`, and it is enforced identically on
+both sides because quantity is the one flag that is never tri-state -- the
+shared-memory snapshot carries it and so does a live bag read.
+
+| Where | Behavior |
+|---|---|
+| Planner | `evaluate_item` blocks `quantity > stack_limit` with `REASON_STACK_TOO_LARGE`, sitting with the protections rather than the inclusion filters: it is a capability limit, not a preference |
+| Coordinator | Never budgets an oversized stack, so the preview and the donor agree; `RoundPlan.ground_item_count` counts *piles*, one per unit |
+| Donor | `Items.DropItems(max_units_per_item=N)` drains a stack by calling the drop once per unit, and **refuses an oversized stack before the first call** |
+| Wire | `TransferDropItems` `ExtraData[2]`, as `stack=N`; absent or unreadable resolves to the default |
+
+**Default 1, ceiling 20.** One means "unstacked items only", which is the honest
+default while one call moves one unit: a stack of ten is ten chances to be
+interrupted, and an interrupted stack ends up split between the donor's bags and
+the floor. The ceiling bounds what a user or a message may *ask* for; raise it
+when `DROP_UNITS_PER_CALL` changes, and not before. `TransferPolicy` itself
+floors the value at 1 but does not cap it, because clamping inside a value object
+would make a policy that does not do what it says -- validation belongs at the
+untrusted edges, which are the widget input and `parse_stack_limit`.
+
+**Why this value crosses the wire when no other policy field does.** Question 4
+in section 11 settled that user policies do not reach donors, and that still
+holds: protected models and quantity floors have no room and no carrier. The
+stack limit is different in kind. It is not a preference about what to give
+away; it is a per-session decision about how many interruptible steps one
+inventory slot may become, the coordinator is the only party that knows it, and
+it is one small integer in a 63-character field that was already empty. Both
+sides rebuild the policy through one function, `resolve_wire_policy`, so a stack
+the preview refused is refused by the donor for the same stated reason.
+
+**Cost of raising it.** A stack of N costs N drop calls, produces N ground piles
+and costs the receiver N pickup walks. It still costs only one receiver slot,
+because the units merge back together on pickup (A4, confirmed). The widget says
+this out loud next to the input rather than letting a user discover it by
+watching a character drop cupcakes one at a time for a minute.
 
 Caution carried over from a known native defect: do **not** identify items by
 decoding UI frame text. The decoded-text-label path has crashed the client
@@ -699,15 +777,186 @@ their items go home rather than dying with the instance. Only after the
 ground is clear, or the user explicitly dismisses, does the session send
 `EnableHeroAI` (exactly one restore per suspend) and clear the busy flag.
 
+### 6.8 What phase 5 changed about the above
+
+Four things the implementation settled differently. Recorded here rather than
+edited into the sections above, so the reasoning survives.
+
+**1. HeroAI is held for the whole session, on every account in the instance, by
+a new leased command pair.** Section 6.2's answer -- re-send `DisableHeroAI` at
+the head of each round -- is withdrawn, and so is the first attempt at replacing
+it.
+
+*Why the plan's answer fails.* `hero_ai_snapshots` is a strict stack: every
+`DisableHeroAI` pushes a snapshot and one `EnableHeroAI` pops exactly one.
+Re-sending per round has two outcomes and both are bad. If
+`HealStaleHeroAISnapshot` does not fire between rounds, the stack grows by one per
+round and the single closing `EnableHeroAI` restores a *disabled* snapshot,
+leaving every donor with HeroAI off and nothing left to turn it back on. If heal
+does fire, it drains the stack between rounds, which is precisely the gap the
+re-send existed to close. The proposal assumed it could have both.
+
+*Why the first fix also failed, found by a live run 2026-09-07.* The initial
+implementation sent no `DisableHeroAI` at all and leaned on the round handlers,
+which each snapshot and restore around their own work. The claim was that only
+the gap *between* rounds was left open, and that its worst case was benign. Both
+halves were wrong, and the run showed the whole party fighting over the drops:
+
+- The unprotected window is *inside* every round, not between them.
+  `TransferDropItems` restores in its own `finally`, which fires the moment a
+  donor finishes dropping -- while the receiver is still walking to the pile. The
+  donor's `Looting` comes straight back on and it retakes its own drop.
+- Only accounts that are sent a transfer message are ever suspended. A party
+  member that is neither donor nor receiver is sent nothing, so it never stops
+  looting at all. Selecting donors decides whose items *move*; it never decided
+  who can interfere.
+
+*The fix.* Two commands appended to `SharedCommandType`:
+
+| Command | Direction | Params | ExtraData |
+|---|---|---|---|
+| `TransferHoldHeroAI` | coordinator -> every account in the instance | `(nonce, lease_ms, 0, 0)` | `(session_id, "", "", "")` |
+| `TransferReleaseHeroAI` | coordinator -> the same accounts | `(0, 0, 0, 0)` | `(session_id, "", "", "")` |
+
+`TransferHoldHeroAI` returns immediately and registers a hold in `_hero_ai_holds`;
+`_tick_hero_ai_holds`, called every frame from `main()`, re-asserts the disabled
+options and restores them when the lease runs out. The hold keeps its **own**
+captured copy of the options and never touches `hero_ai_snapshots`, which is what
+keeps `HealStaleHeroAISnapshot` out of the way -- heal only drains accounts that
+have entries on that stack. The command is deliberately **not** in
+`_HERO_AI_SUSPENDING_COMMANDS`, because there is nothing there for heal to drain.
+
+Putting the restore in the per-frame sweeper rather than in the handler that took
+the hold is the point of the design: a coroutine can die, a widget can be
+disabled, a session can be aborted without ever sending its release, and none of
+those may leave a character permanently unable to fight or loot. The sweeper is
+the thing that always runs, so it is the thing that owns giving the options back.
+
+**This is the second attempt, and section 6.9 records why the first one failed.**
+
+The **lease** is what makes holding one safe, and it is not optional. A
+suspension with no expiry is the single worst thing this feature could cause: a
+character unable to fight or loot with nothing alive to restore it. The
+coordinator releases on every exit path -- finish, abort, exception -- and renews
+at the head of each round with the round id as the nonce, because `SendMessage`
+would otherwise deduplicate an identical renewal and the lease would never move.
+A repeat for a session already held extends the deadline rather than pushing a
+second snapshot. If the coordinator dies anyway, the hold lapses on its own, and
+the Run panel's **Force restore hero AI** button is there for anyone unwilling to
+wait it out.
+
+The cohort is `inventory_transfer.accounts_sharing_instance`, which is the whole
+party in the receiver's instance including bystanders, and which excludes a
+partyless account even on a matching map, because explorable instances are
+party-scoped and it is not in the same copy of the map.
+
+`PauseWidgets` is unchanged and still donor-only: it prevents a different problem
+-- `AutoInventoryHandler` salvaging an item already queued to be dropped -- and
+pausing this client would pause this widget, which is optional, stopping the
+session mid-flight.
+Because a paused donor has no way to unpause itself if the coordinator dies, the
+Run panel carries a manual "resume donor widgets" button.
+
+**2. The stall guard reads the receiver's report, not its free-slot delta.**
+`reconcile_round` gained an optional `collected_items`. The delta under-counts
+every merge -- an item landing in an existing stack costs no slot -- so two
+merge-only rounds in a row would stall a session that is working perfectly. The
+old derivation stays as the fallback for a caller without a receiver report,
+which is what this function had before the receiver reported at all.
+
+**3. The round report store moved into the planner module.** It was a `setattr`
+on `GLOBAL_CACHE` read by `Messaging.py`; the widget needs it too, and widgets
+cannot import one another. `Py4GWCoreLib` is loaded once per process, so a
+module-level dict there survives a widget reload for exactly the same reason
+`GLOBAL_CACHE` does, with one declared owner instead of an undeclared attribute
+and two readers. It is bounded at `MAX_ROUND_REPORTS`, because an aborted session
+or a recall leaves entries no coordinator will ever clear.
+`Messaging.get_transfer_reports` / `clear_transfer_reports` remain as aliases,
+since the section 9 hand-driven check names them.
+
+**4. `SETTLE` warns and resumes; it does not hold the suspension open.** Section
+6.7 wanted the session to wait for the ground to clear before resuming. That
+conflicts with question 3's "warn, never block", and holding a snapshot open
+across an indefinite user wait is exactly the state heal treats as stale. So the
+session resumes immediately -- exactly one resume per pause, on every exit path
+including abort and an exception -- and the leftover warning plus Recall stay on
+screen as a dismissable notice that outlives the session that raised it.
+
+**5. `PixelStack` is not used.** The rally step it was proposed for is already
+inside `TransferDropItems`, which carries the rally coordinates and walks the
+donor there itself. A separate rally command would be a second way for the rally
+point to be wrong.
+
+### 6.9 The transport serialises one message per sender-receiver pair
+
+*Found by the live run of 2026-09-07, and this is the most transferable thing
+this feature has learned. It is not a transfer rule; it constrains every
+multibox feature that sends more than one message to the same account.*
+
+`AllAccounts.SendMessage` scans the inbox for a slot to reuse before it queues.
+That scan contains this, at `AllAccounts.py:964`:
+
+```python
+if message.Running:
+    if int(PySystem.get_tick_count64() - message.Timestamp) < _MESSAGE_RUNNING_STALE_MS:
+        return i          # returns a slot index, having queued nothing
+    continue
+```
+
+It runs **before** the command, params and `ExtraData` comparisons. So *any*
+running message between a given sender and receiver makes every further send to
+that receiver a silent no-op for up to `_MESSAGE_RUNNING_STALE_MS`, which is
+60 000. The caller cannot detect it: the return value is a valid slot index,
+indistinguishable from a successful queue.
+
+Two defects in this feature followed directly, and the log reads as a clock:
+
+| Time | Line | Cause |
+|---|---|---|
+| 13:54:45 | round 1 asked | drop message swallowed by the running hold |
+| 13:55:45 | "no answer from the donor" | exactly 60 s -- the hold went stale |
+| 13:55:45 | receiver's pickup ran, logged, and reported nothing | its report was swallowed by its own still-running message |
+| 13:56:45 | "the receiver never reported" | exactly 60 s again |
+| 13:56:45 | round 2 asked; donor drops 7 items in one second | channel finally clear |
+
+1. **A long-running handler cannot be used to hold state open.** The first
+   implementation of `TransferHoldHeroAI` was a coroutine that stayed `Running`
+   for the whole session precisely so its message stayed `Active` and heal would
+   leave it alone. That worked, and it also jammed the coordinator's channel to
+   every held account for 60 seconds -- including the drop commands. The
+   replacement registers a hold and returns; a per-frame sweeper enforces and
+   ends it. See 6.8.
+2. **Report before finishing and the report is lost.** Both round handlers sent
+   their `TransferReport` from the `finally` *before* `MarkMessageAsFinished`.
+   For a donor that is harmless -- the report travels donor to coordinator, a
+   different pair. For the receiver it is fatal, because the widget pins the
+   coordinator to the receiver, so sender and receiver are one account and the
+   still-running pickup message swallowed its own report. Every round therefore
+   burned the full collect timeout and reconciled `collected = 0`, which is why
+   a run that visibly picked up seven items reported "0 item(s) collected" and
+   stalled. The two lines are now the other way round.
+
+**The rule for anything else in this repository:** do not send a second message
+to an account while your first one is still running, and do not send anything
+from inside a handler before that handler's message is marked finished. If you
+need a long-lived per-account state, own it in a module-level record swept from
+`main()`; do not hold it open with a running message.
+
+Whether `SendMessage` should compare the command before short-circuiting on a
+running message is a real question for that owner. It looks like a bug -- the
+enclosing loop is a *deduplicator*, and this branch deduplicates messages that
+are not duplicates -- but existing callers may lean on the accidental
+serialisation, so it is filed here rather than changed as part of this feature.
+
 ## 7. Files to add or change
 
 | File | Change |
 |---|---|
-| `Py4GWCoreLib/enums_src/Multiboxing_enums.py` | append `TransferDropItems`, `TransferPickUpItems`, `TransferReport` |
+| `Py4GWCoreLib/enums_src/Multiboxing_enums.py` | append `TransferDropItems`, `TransferPickUpItems`, `TransferReport`, then `TransferHoldHeroAI`, `TransferReleaseHeroAI` |
 | `Py4GWCoreLib/py4gwcorelib_src/inventory_transfer.py` | **new** - pure planner: eligibility, `predict_slot_cost`, round decomposition, reconciliation. No `Py4GW` imports |
 | `Py4GWCoreLib/routines_src/yield_src/items.py` | add `Items.DropItems(item_ids)` and `Items.LootGroundItems(radius, max_items)`; the latter builds an unowned-item array and delegates to the existing `LootItems` |
 | `Widgets/System/Messaging.py` | add the three handlers and their `ProcessMessages()` cases |
-| `Widgets/Guild Wars/Items & Loot/InventoryTransfer.py` | **new** widget: account selection, receiver picker, policy editor, precheck, preview (phase 4, landed); run/abort/recall/progress still to come |
+| `Widgets/Guild Wars/Items & Loot/InventoryTransfer.py` | **new** widget: account selection, receiver picker, policy editor, precheck, preview (phase 4), and the live session with run/abort/recall/progress (phase 5) |
 | `Examples and tests/tests/test_inventory_transfer_planner.py` | **new** offline planner tests |
 | `docs/loot/plans/cross-account-inventory-transfer.md` | this document |
 | `docs/loot/plans/README.md` | index entry |
@@ -773,17 +1022,19 @@ Each phase is independently reviewable and leaves the tree buildable.
    `explain_rejections`: the snapshot cannot see tradability, so listing what
    `select_droppable` refused would report "tradability unknown" for nearly
    every item and tell the user nothing.
-5. **Widget, live.** Run, abort, recall, progress, settle warnings. Shaped by
-   the four answers in section 11: the coordinator is the receiver, donors are
-   paused by default, leftovers warn without blocking, and only built-in policy
-   names go on the wire. The suspend gap in section 6.2 is answered by
-   re-sending `DisableHeroAI` at the head of each round rather than teaching
-   `HealStaleHeroAISnapshot` about owned sessions -- a round already carries a
-   HeroAI-suspending message, so the heal logic keeps working unchanged for
-   every other caller.
-   Blocked on live evidence, not on design: nothing in phases 2-4 has run
-   against an injected client, so A1-A7 are all unconfirmed and the hand-driven
-   protocol check in section 9 has never been performed.
+5. **Widget, live.** *Implemented, live verification outstanding.* Run, abort,
+   recall, progress and the leftover warning, driven by a flat state machine
+   ticked from the widget's `update()` callback so a collapsed window cannot
+   stall a round mid-flight. Shaped by the four answers in section 11: the
+   coordinator is pinned to the receiver (Run refuses otherwise, because the
+   rally point is where this character stands), donors are paused by default,
+   leftovers warn without blocking, and only built-in policy names go on the
+   wire -- with the stack limit of section 4.1 as the one deliberate scalar
+   exception. The suspend gap is **not** closed by re-sending `DisableHeroAI`;
+   that answer is withdrawn in section 6.8 for reasons the stack semantics of
+   `hero_ai_snapshots` make unavoidable.
+   Still to do: run it. The machine is proved offline and by inspection only.
+   Start with the two-account, one-throwaway-item case in section 9.
 6. **Optional extras.** Gold transfer, `PauseWidgets` integration, chained
    receivers.
 
@@ -805,6 +1056,19 @@ check not counting as a pass; the coordinator's exclusion explainer listing only
 proven-ineligible items; and the policy text parsers, including the half-typed
 input that must not blank a list.
 
+Phase 5 added: the stack gate, reached identically from a snapshot record and a
+live one; the ground-pile accounting a stack produces; the stack-limit wire field
+including every malformed input; the report store's overwrite rule and its bound;
+and the round-outcome logic that decides a round is over -- including that a
+donor reporting "nothing eligible" *completes* a round rather than hanging it.
+
+The stack gate forced one change to the existing fixtures: every policy in the
+file now opts into whole stacks explicitly, because the shipped default is
+"unstacked items only" and leaving them at it would have silently gutted the
+merge and budget coverage rather than testing it. That is a fixture change worth
+noticing in review -- it is exactly the shape of edit that makes a suite go green
+by asking easier questions.
+
 The widget itself is not covered here, and cannot be: it imports `PyImGui` and
 `Py4GWCoreLib`, so it needs an injected client to load at all. That is the
 reason every pure decision it makes lives in the planner instead -- the widget
@@ -818,9 +1082,11 @@ to it is that the count and the list are unchanged, checked against
 
 The widget has a different bar than the planner, and it is worth stating so a
 later reader does not "fix" it. At the project configuration it is clean. At
-`strict` it reports four diagnostics, all of them the return or parameter types
+`strict` it reports five diagnostics, all of them the return or parameter types
 of `Py4GWCoreLib` surfaces it merely calls -- `Color.to_tuple_normalized`,
-`ConsoleLog`, `ImGui.Begin`. Those are upstream gaps shared by every widget in
+`ConsoleLog`, `ImGui.Begin`, and since phase 5 `ShMem.SendMessage`, whose
+`params` and `ExtraData` are declared as a bare `tuple`. Those are upstream gaps
+shared by every widget in
 the tree; narrowing them belongs to those owners, not to a caller. Hoisting the
 five colour constants to module level already collapsed thirty-three of those
 call sites into one, which was worth doing for the per-frame work it saves as
@@ -828,7 +1094,8 @@ much as for the diagnostics.
 
 **Widget dry run (phase 4, no live risk):** enable
 `Inventory Transfer` in the widget manager with at least two accounts running.
-Nothing it does is observable in game, so this is safe to run anywhere.
+Everything outside the Run panel is computation and drawing, so this much is
+safe to do anywhere; do not press Run while checking it.
 
 1. Every account publishing to shared memory appears in Participants, with its
    map, party, free slots and state.
@@ -840,8 +1107,44 @@ Nothing it does is observable in game, so this is safe to run anywhere.
 4. The round 1 message preview matches what section 6.5 specifies: one
    `TransferDropItems` per donor carrying that donor's `max_items`, one
    `TransferPickUpItems` to the receiver, `2N + 2` messages for the round.
-5. Nothing is sent. `grep -n SendMessage` over the widget returns only the
-   docstring line that says so.
+5. Nothing is sent while Run is untouched. The only `SendMessage` call in the
+   widget is `TransferSession._send`, reachable only from `start`, `tick`,
+   `recall` and `resume_donors`.
+6. With the stack limit at 1, a donor holding a stack shows it under exclusions
+   as "stack larger than the drop limit" and it never appears in a round. Raising
+   the limit past the stack size moves it into the plan, and the preview's pile
+   count rises by the stack size while its slot cost stays at one.
+
+**Live run check (phase 5, two accounts, one throwaway item):** this moves a real
+item. Do it in that order and stop at the first surprise.
+
+1. Receiver is *this* client, donor is the other, both in one explorable area and
+   one party, stack limit 1. Run. Expect: one round, the donor walks to this
+   character, drops one item, this character collects it, progress shows
+   `1 / 1 / 0`, and the session ends with "donors have nothing eligible left".
+2. Abort mid-round. Expect the session to stop sending, donor widgets to resume,
+   and the phase to reach `finished` rather than sticking.
+3. Receiver with exactly one free slot and a donor holding three items. Expect
+   the safety margin to hold the round to nothing, or one item moved and a clean
+   stop -- not a pile on the floor.
+4. Force a leftover: fill the receiver, then Run. Expect the leftover warning
+   with a count, and Recall to send the donors after their own drops.
+5. Raise the stack limit to 3 with a donor holding a stack of 3. Expect three
+   drop calls, three ground piles, one receiver slot used, and the donor's bag
+   slot emptied. **This is the case that has never worked**, so confirm the stack
+   is fully gone from the donor rather than partially dropped.
+6. Confirm no donor is left with HeroAI disabled or widgets paused after any of
+   the above, including after an abort.
+7. **The suspension case, which the 2026-09-07 run failed.** Run with a third
+   account in the party that is neither donor nor receiver. Expect every account
+   in the instance -- including that bystander -- to log `Hero AI held for
+   session <id>`, to stop following, fighting and looting for the whole run, and
+   to log `Hero AI hold ... released` at the end. Nobody but the receiver should
+   touch the pile. Then confirm all five options are back exactly as they were on
+   every account, bystander included.
+8. Kill the coordinator mid-run (disable the widget) and confirm the hold lapses
+   on its own within the lease rather than stranding anyone, and that **Force
+   restore hero AI** ends it immediately from a fresh session.
 
 **Hand-driven protocol check (phase 3, two accounts, no widget):** send the
 messages from the Messaging window's send-message section. The commands appear
@@ -943,6 +1246,16 @@ lived in a conversation is a decision that gets relitigated.
    built-in policies, which is the only thing a donor can resolve. The
    protected-model and quantity-floor fields stay in the widget as forecasting
    aids and the Run control says plainly that a donor will not honour them.
+
+   *Refined during phase 5:* one scalar does cross, and section 4.1 explains
+   why the stack limit is not an exception to this rule so much as a different
+   question. It is not a preference about what to give away but a bound on how
+   many interruptible steps a slot may become; only the coordinator knows it;
+   and it is one integer in an `ExtraData` field that was already empty. Both
+   sides rebuild the policy through `resolve_wire_policy`, so nothing else about
+   the "name is the whole contract" rule changes. Note also that the maintainer
+   ruled the version-skew worry moot: every account is launched from one
+   launcher against one DLL, so a donor on an older build is not a real case.
 
    The reasoning, since this one looks like a hole and mostly is not: the
    refusals that actually matter -- untradeable items, customized gear, the last

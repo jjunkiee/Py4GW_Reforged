@@ -25,10 +25,21 @@ eligibility is three-valued: :data:`VERDICT_ALLOWED`, :data:`VERDICT_UNVERIFIED`
 only the first. An unresolved flag therefore cannot reach a real `DropItem`
 call by accident, and the coordinator still gets a usable budget.
 
-Every stack number here rests on assumptions A1, A4 and A7 in the plan, none of
-which is verified against a live client yet. Until they are, keep
-:attr:`TransferPolicy.optimistic_merge` off, which makes every ground stack
-reserve a whole slot and makes the math unable to under-count.
+Live runs on 2026-09-03 settled the stack assumptions this module encodes. A4
+(a 250 cap, and a pickup topping off partial stacks before spilling) and A7
+(dyes share a model id and refuse to merge across colours) both held. A1 did
+not: the native binding drops **one unit per call** whatever quantity it is
+handed, so moving a stack of ten means ten drops, ten ground piles and ten
+pickup walks. That is a defect in `Py4GW_Reforged_Native`, not something this
+module can fix, so it is bounded instead --
+:attr:`TransferPolicy.max_stack_quantity` refuses any stack the session is not
+willing to spend that many interruptible steps on, and defaults to 1, which
+means "unstacked items only".
+
+:attr:`TransferPolicy.optimistic_merge` stays off by default even though A4 and
+A7 now support it. With it off every ground stack reserves a whole slot: that
+can waste a round, and it can never under-count, which is still the trade worth
+making on the path that moves someone's real items.
 """
 
 import math
@@ -50,6 +61,29 @@ STACK_MAX = 250
 #: combine. Assumption A7, unverified -- a wrong entry here only costs an extra
 #: round, a missing one costs a mispredicted slot budget.
 NON_MERGING_MODELS: frozenset[int] = frozenset({146})
+
+#: Units one `DropItem` call actually moves, whatever quantity it is handed.
+#: Assumption A1 was **disproved** live on 2026-09-03: the native binding builds
+#: a `DROP_ITEM` packet carrying a quantity word of 1 no matter what Python
+#: passed, so a stack only leaves the bags if the donor calls the drop once per
+#: unit. The defect belongs to `GW::item::DropItem` in `Py4GW_Reforged_Native`;
+#: everything here is the workaround, and it becomes dead weight -- not wrong --
+#: the day that binding honours its second argument.
+DROP_UNITS_PER_CALL = 1
+
+#: Largest stack the transfer will move when nothing says otherwise. One means
+#: "unstacked items only", which is the honest default while a stack costs one
+#: drop call, one ground pile and one pickup walk *per unit*: a stack of ten is
+#: ten chances to be interrupted, and an interrupted stack ends up split across
+#: two accounts and the floor.
+DEFAULT_MAX_STACK_QUANTITY = 1
+
+#: Ceiling the widget's input and :func:`parse_stack_limit` clamp to. Not a game
+#: limit and not enforced by `TransferPolicy` itself -- it bounds what a user or
+#: a message may *ask* for, on the grounds that no inventory slot should be
+#: allowed to become twenty interruptible steps of walking and dropping. Raise
+#: it when `DROP_UNITS_PER_CALL` does, and not before.
+MAX_STACK_QUANTITY = 20
 
 #: Bag ids the transfer reads, in the order both sides walk them. Equipment
 #: Pack (5) and equipped items (22) are absent by construction, so equipped
@@ -101,6 +135,7 @@ REASON_MODEL_FLOOR = "would drop below the model quantity floor"
 REASON_LAST_ID_KIT = "last identification kit"
 REASON_LAST_SALVAGE_KIT = "last salvage kit"
 REASON_NOT_STACKABLE = "not stackable"
+REASON_STACK_TOO_LARGE = "stack larger than the drop limit"
 REASON_MODEL_NOT_LISTED = "model not on the whitelist"
 REASON_ITEM_TYPE_NOT_LISTED = "item type not on the whitelist"
 
@@ -366,6 +401,13 @@ class TransferPolicy:
     #: Slots held back so one mispredicted merge cannot wedge a round.
     safety_margin: int = 1
 
+    #: Largest stack this transfer will move. Each unit costs its own drop call
+    #: while `DROP_UNITS_PER_CALL` is 1, so this is the knob that decides how
+    #: long a single inventory slot may hold a round open. Unlike the fields
+    #: below it, this one does reach the donor: it rides in the drop message's
+    #: third `ExtraData` field rather than being implied by the policy name.
+    max_stack_quantity: int = DEFAULT_MAX_STACK_QUANTITY
+
     keep_last_id_kit: bool = True
     keep_last_salvage_kit: bool = True
 
@@ -396,6 +438,27 @@ class TransferPolicy:
                 return max(int(floor), 0)
         return 0
 
+    @property
+    def stack_limit(self) -> int:
+        """The limit as every check reads it: at least one, otherwise as given.
+
+        Deliberately floored and not capped. `MAX_STACK_QUANTITY` is what the
+        widget's input and :func:`parse_stack_limit` clamp to, because those read
+        untrusted values; a policy built in code is trusted with the number it
+        was handed. Silently overriding a caller's field would make a policy that
+        does not do what it says, which is a worse failure than a large one.
+        """
+        return max(1, int(self.max_stack_quantity))
+
+    @property
+    def drop_calls_per_stack(self) -> int:
+        """Drop calls the largest stack this policy allows will cost.
+
+        For the preview, which would otherwise be silent about the fact that
+        raising the limit buys *slower* rounds, not bigger ones.
+        """
+        return -(-self.stack_limit // max(DROP_UNITS_PER_CALL, 1))
+
 
 #: The policy a `TransferDropItems` message means when it names nothing, or
 #: names something this build does not know.
@@ -425,6 +488,62 @@ def resolve_policy(name: str, extra: dict[str, TransferPolicy] | None = None) ->
     if extra and key in extra:
         return extra[key]
     return BUILTIN_POLICIES.get(key, BUILTIN_POLICIES[DEFAULT_POLICY_NAME])
+
+
+#: Prefix the drop message's third `ExtraData` field carries, so a reader can
+#: tell a stack limit from whatever else that field may grow to hold later.
+STACK_LIMIT_FIELD_PREFIX = "stack="
+
+
+def format_stack_limit(limit: int) -> str:
+    """Render a stack limit for `TransferDropItems` `ExtraData[2]`.
+
+    Every account runs the same build from one launcher, so this is not a
+    version-negotiation field -- it exists because the limit is a *session*
+    decision the coordinator makes and the donor enforces, and a policy name has
+    no room to say it. Six characters into a 63-character field.
+    """
+    return "%s%d" % (STACK_LIMIT_FIELD_PREFIX, max(1, min(int(limit), MAX_STACK_QUANTITY)))
+
+
+def parse_stack_limit(text: str, default: int = DEFAULT_MAX_STACK_QUANTITY) -> int:
+    """Read `ExtraData[2]` back, falling back to the conservative default.
+
+    Accepts the prefixed form and a bare integer, and answers `default` for an
+    empty or unreadable field. Falling back rather than raising is deliberate:
+    an unset field means a coordinator that did not ask for stacks, and the
+    quiet answer to that is to move none -- never to guess a larger number.
+    """
+    fallback = max(1, min(int(default), MAX_STACK_QUANTITY))
+    token = str(text or "").strip().lower()
+    if not token:
+        return fallback
+    if token.startswith(STACK_LIMIT_FIELD_PREFIX):
+        token = token[len(STACK_LIMIT_FIELD_PREFIX) :].strip()
+    try:
+        limit = int(token)
+    except ValueError:
+        return fallback
+    return max(1, min(limit, MAX_STACK_QUANTITY))
+
+
+def resolve_wire_policy(
+    policy_name: str,
+    stack_limit_field: str = "",
+    extra: dict[str, TransferPolicy] | None = None,
+) -> TransferPolicy:
+    """Rebuild the policy a `TransferDropItems` message describes.
+
+    The message carries a policy *name* plus one loose value, and both sides have
+    to arrive at the same object from them: the coordinator to budget the round,
+    the donor to decide what it actually lets go of. One function, so a stack the
+    preview refused is refused by the donor for the same stated reason instead of
+    for a coincidentally similar one.
+    """
+    return replace(
+        resolve_policy(policy_name, extra),
+        max_stack_quantity=parse_stack_limit(stack_limit_field),
+    )
 
 
 def parse_model_list(text: str) -> tuple[int, ...]:
@@ -551,6 +670,16 @@ def evaluate_item(item: ItemRecord, policy: TransferPolicy, context: DonorContex
 
     if policy.protect_quest_items and item.item_type == QUEST_ITEM_TYPE:
         return EligibilityResult(VERDICT_BLOCKED, REASON_QUEST_ITEM)
+
+    # Quantity is the one flag that is never tri-state: the shared-memory
+    # snapshot carries it and so does a live bag read, so both sides reach the
+    # same verdict here and a stack refused by the coordinator is refused by the
+    # donor for the same stated reason. It sits with the protections rather than
+    # with the inclusion filters below because it is a capability limit -- the
+    # binding cannot move this in one call -- not a user preference, and saying
+    # so is more actionable than "not on the whitelist".
+    if item.effective_quantity > policy.stack_limit:
+        return EligibilityResult(VERDICT_BLOCKED, REASON_STACK_TOO_LARGE)
 
     if policy.stackables_only and item.stackable is False:
         return EligibilityResult(VERDICT_BLOCKED, REASON_NOT_STACKABLE)
@@ -783,6 +912,17 @@ class PlannedDrop:
     item: ItemRecord
     slot_cost: int
 
+    @property
+    def ground_items(self) -> int:
+        """Separate ground piles this drop will produce.
+
+        One per unit, because the binding moves one unit per call (A1). This is
+        what the receiver's pickup budget has to count: budgeting it in bag
+        slots would tell a receiver holding a donor's stack of three to collect
+        one pile and walk away from the other two.
+        """
+        return max(self.item.effective_quantity // max(DROP_UNITS_PER_CALL, 1), 1)
+
 
 @dataclass(frozen=True)
 class RoundPlan:
@@ -804,6 +944,11 @@ class RoundPlan:
         return sum(drop.slot_cost for drop in self.drops)
 
     @property
+    def ground_item_count(self) -> int:
+        """Piles this round will put on the floor. The receiver's pickup budget."""
+        return sum(drop.ground_items for drop in self.drops)
+
+    @property
     def donor_keys(self) -> tuple[str, ...]:
         seen: list[str] = []
         for drop in self.drops:
@@ -814,6 +959,10 @@ class RoundPlan:
     def budget_for(self, donor_key: str) -> int:
         """`max_items` for this donor's `TransferDropItems` message."""
         return sum(1 for drop in self.drops if drop.donor_key == donor_key)
+
+    def ground_items_for(self, donor_key: str) -> int:
+        """Piles this donor alone will put on the floor."""
+        return sum(drop.ground_items for drop in self.drops if drop.donor_key == donor_key)
 
     def drops_for(self, donor_key: str) -> tuple[PlannedDrop, ...]:
         return tuple(drop for drop in self.drops if drop.donor_key == donor_key)
@@ -990,8 +1139,15 @@ class RoundReport:
     on_ground: int
     stalled: bool
 
+    #: What the receiver said it collected, when it said anything. `None` falls
+    #: back to inferring it from what the donors dropped and what is still lying
+    #: there, which is all this had before the receiver reported at all.
+    reported_collected: int | None = None
+
     @property
     def collected_items(self) -> int:
+        if self.reported_collected is not None:
+            return max(int(self.reported_collected), 0)
         return max(self.dropped_items - self.on_ground, 0)
 
     @property
@@ -1010,20 +1166,29 @@ def reconcile_round(
     receiver_free_after: int,
     ground_items_left: int,
     tracker: StallTracker | None = None,
+    collected_items: int | None = None,
 ) -> RoundReport:
     """Turn one round's live re-reads into a report and advance the stall guard.
 
-    "Moved" is measured by the receiver's free-slot delta rather than by the
-    donors' reports: a donor reports what it dropped, which is not the same as
-    what the receiver managed to pick up, and only the latter earns the session
-    another round.
+    "Moved" is measured on the receiver, never on the donors: a donor reports
+    what it dropped, which is not the same as what the receiver managed to pick
+    up, and only the latter earns the session another round.
+
+    *Which* receiver measurement matters. Pass `collected_items` -- the count in
+    the receiver's own `TransferReport` -- and the stall guard uses that. Without
+    it the guard falls back to the free-slot delta, which under-counts every
+    merge: an item that lands in an existing stack costs no slot, so a round that
+    moved a dozen of them looks empty and two of those in a row would stall a
+    session that is working perfectly. The fallback is kept because this function
+    predates the receiver's report and a caller without one is still better off
+    with an imperfect signal than none.
     """
     dropped = sum(max(int(count), 0) for count in dropped_by_donor.values())
     slots_used = max(int(receiver_free_before) - int(receiver_free_after), 0)
     on_ground = max(int(ground_items_left), 0)
 
     guard = tracker if tracker is not None else StallTracker()
-    stalled = guard.record(slots_used)
+    stalled = guard.record(slots_used if collected_items is None else max(int(collected_items), 0))
 
     return RoundReport(
         round_id=plan.round_id,
@@ -1032,6 +1197,7 @@ def reconcile_round(
         slots_used=slots_used,
         on_ground=on_ground,
         stalled=stalled,
+        reported_collected=None if collected_items is None else max(int(collected_items), 0),
     )
 
 
@@ -1067,6 +1233,165 @@ STATUS_NAMES: dict[int, str] = {
 def status_name(status: int) -> str:
     """Human-readable form of a report status, for the UI and the console."""
     return STATUS_NAMES.get(int(status), "unknown status %d" % int(status))
+
+
+# --- Round reports ---------------------------------------------------------
+
+# The coordinator files every `TransferReport` it receives and the widget reads
+# them back to decide a round is over. Those are two different files -- the
+# message handler in `Widgets/System/Messaging.py` and the widget in
+# `Widgets/Guild Wars/Items & Loot/InventoryTransfer.py` -- and widgets are not
+# importable from one another, so the store has to sit somewhere they share.
+#
+# It lives here rather than as a `setattr` on `GLOBAL_CACHE` because this module
+# is already imported by both and is loaded once for the process: a module-level
+# dict in `Py4GWCoreLib` outlives a widget reload for exactly the same reason
+# `GLOBAL_CACHE` itself does, and it has one declared owner instead of an
+# undeclared attribute and two readers.
+
+
+@dataclass(frozen=True)
+class TransferReportEntry:
+    """One participant's result for one round, as the coordinator files it."""
+
+    session_id: str
+    round_id: int
+    reporter_email: str
+    items_moved: int
+    slots_used: int
+    status: int
+    timestamp: int = 0
+
+    @property
+    def ok(self) -> bool:
+        return self.status == STATUS_OK
+
+    @property
+    def status_text(self) -> str:
+        return status_name(self.status)
+
+
+#: `(session_id, round_id, reporter_email) -> entry`. Keyed by reporter so a
+#: participant that answers twice for one round overwrites rather than
+#: double-counting -- which matters, because a report is how the coordinator
+#: decides a round is finished.
+_ROUND_REPORTS: dict[tuple[str, int, str], TransferReportEntry] = {}
+
+#: Entries kept before the oldest are dropped. A coordinator clears each round as
+#: it reconciles it, but nothing is *obliged* to: an aborted session, a recall, or
+#: a client that never ran the widget all leave entries with no owner to remove
+#: them. A round costs at most one entry per participant, so this holds many
+#: sessions' worth and still cannot grow without bound over a long play session.
+MAX_ROUND_REPORTS = 512
+
+
+def file_transfer_report(entry: TransferReportEntry) -> None:
+    """Record one participant's answer. Called by the message handler."""
+    _ROUND_REPORTS[(entry.session_id, entry.round_id, entry.reporter_email)] = entry
+    # Insertion-ordered, so the front of the dict is the oldest report filed.
+    while len(_ROUND_REPORTS) > MAX_ROUND_REPORTS:
+        _ROUND_REPORTS.pop(next(iter(_ROUND_REPORTS)))
+
+
+def get_transfer_reports(session_id: str, round_id: int | None = None) -> tuple[TransferReportEntry, ...]:
+    """Every report filed for a session, optionally narrowed to one round."""
+    session = str(session_id or "").strip()
+    entries = [
+        entry
+        for (entry_session, entry_round, _reporter), entry in _ROUND_REPORTS.items()
+        if entry_session == session and (round_id is None or entry_round == int(round_id))
+    ]
+    entries.sort(key=lambda entry: (entry.round_id, entry.reporter_email))
+    return tuple(entries)
+
+
+def clear_transfer_reports(session_id: str, round_id: int | None = None) -> None:
+    """Forget a session's reports once the coordinator has reconciled them."""
+    session = str(session_id or "").strip()
+    stale = [key for key in _ROUND_REPORTS if key[0] == session and (round_id is None or key[1] == int(round_id))]
+    for key in stale:
+        _ROUND_REPORTS.pop(key, None)
+
+
+@dataclass(frozen=True)
+class RoundOutcome:
+    """What one round's reports add up to, from the coordinator's side.
+
+    The live session's two waits -- "have all the donors answered?" and "has the
+    receiver answered?" -- are the part of phase 5 most worth proving offline,
+    so the arithmetic is here and only the timing is in the widget.
+    """
+
+    round_id: int
+    receiver_key: str
+    donor_keys: tuple[str, ...]
+    reports: tuple[TransferReportEntry, ...] = ()
+
+    def _by(self, key: str) -> TransferReportEntry | None:
+        for entry in self.reports:
+            if entry.reporter_email == key:
+                return entry
+        return None
+
+    @property
+    def missing_donors(self) -> tuple[str, ...]:
+        return tuple(key for key in self.donor_keys if self._by(key) is None)
+
+    @property
+    def drops_complete(self) -> bool:
+        """Every donor asked has answered, however it answered."""
+        return not self.missing_donors
+
+    @property
+    def receiver_report(self) -> TransferReportEntry | None:
+        return self._by(self.receiver_key)
+
+    @property
+    def receiver_reported(self) -> bool:
+        return self.receiver_report is not None
+
+    @property
+    def dropped(self) -> int:
+        """Items the donors say left their bags."""
+        return sum(entry.items_moved for entry in self.reports if entry.reporter_email in self.donor_keys)
+
+    @property
+    def collected(self) -> int:
+        """Ground piles the receiver says it picked up."""
+        entry = self.receiver_report
+        return entry.items_moved if entry is not None else 0
+
+    @property
+    def failures(self) -> tuple[TransferReportEntry, ...]:
+        """Reports that came back with anything other than STATUS_OK.
+
+        Not necessarily an error the session should stop for: a donor with
+        nothing eligible left reports `STATUS_NOTHING_ELIGIBLE`, which is how a
+        transfer ends normally.
+        """
+        return tuple(entry for entry in self.reports if not entry.ok)
+
+
+def summarize_round_reports(
+    round_id: int,
+    session_id: str,
+    receiver_key: str,
+    donor_keys: Sequence[str],
+    reports: Iterable[TransferReportEntry] | None = None,
+) -> RoundOutcome:
+    """Collect one round's filed reports into a verdict.
+
+    `reports` is injectable so the offline fixture can prove this without
+    touching the module-level store; the live caller leaves it `None` and gets
+    whatever the message handler has filed.
+    """
+    filed = tuple(reports) if reports is not None else get_transfer_reports(session_id, round_id)
+    return RoundOutcome(
+        round_id=int(round_id),
+        receiver_key=str(receiver_key or ""),
+        donor_keys=tuple(donor_keys),
+        reports=tuple(entry for entry in filed if entry.round_id == int(round_id)),
+    )
 
 
 # --- Session precheck ------------------------------------------------------
@@ -1277,6 +1602,36 @@ def can_communicate(sender: ParticipantState, receiver: ParticipantState) -> boo
     if sender.isolation_group > 0 or receiver.isolation_group > 0:
         return False
     return not sender.isolated and not receiver.isolated
+
+
+def accounts_sharing_instance(
+    receiver: ParticipantState, everyone: Iterable[ParticipantState]
+) -> tuple[str, ...]:
+    """Keys of every account in the receiver's instance, the receiver included.
+
+    This is the set a transfer has to quieten, and it is deliberately wider than the
+    set it talks to. A party member that is neither donor nor receiver still has
+    HeroAI `Looting` armed, is standing in the same instance, and will happily take
+    a pile it was never told about -- which is exactly what a live run showed.
+    Selecting donors decides whose items move; it does not decide who can interfere.
+
+    An account with no party is excluded even if its map matches: explorable
+    instances are party-scoped, so it is not in the same copy of the map and cannot
+    reach the pile.
+    """
+    wanted = receiver.instance_key
+    if receiver.party_id <= 0:
+        return ()
+
+    keys: list[str] = []
+    for account in everyone:
+        if not account.key or account.party_id <= 0:
+            continue
+        if account.instance_key != wanted:
+            continue
+        if account.key not in keys:
+            keys.append(account.key)
+    return tuple(keys)
 
 
 def _name_list(participants: Iterable[ParticipantState]) -> str:
