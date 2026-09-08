@@ -2143,6 +2143,7 @@ def OpenChest(index: int, message: SharedMessageStruct):
 # region PickUpLoot
 def PickUpLoot(index:int , message: SharedMessageStruct):
     def _get_loot_exit_reason() -> str:
+        """Report only. Unwinding belongs to the `finally`, which owns the snapshot and the message."""
         if not Routines.Checks.Map.MapValid():
             return "map_invalid"
 
@@ -2155,6 +2156,12 @@ def PickUpLoot(index:int , message: SharedMessageStruct):
             return "inventory_full"
 
         return ""
+
+    def _log_loot_exit(reason: str) -> None:
+        if reason == "map_invalid":
+            ConsoleLog("PickUp Loot", "Map is not valid, halting.", Console.MessageType.Warning)
+        elif reason == "inventory_full":
+            ConsoleLog("PickUp Loot", "No free slots in inventory, halting.", Console.MessageType.Warning)
 
     def _GetBaseTimestamp():
         SHMEM_ZERO_EPOCH = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
@@ -2199,10 +2206,7 @@ def PickUpLoot(index:int , message: SharedMessageStruct):
                 if claimed_item_id:
                     clear_loot_lock(claimed_item_id)
                     claimed_item_id = 0
-                if exit_reason == "map_invalid":
-                    ConsoleLog("PickUp Loot", "Map is not valid, halting.", Console.MessageType.Warning)
-                elif exit_reason == "inventory_full":
-                    ConsoleLog("PickUp Loot", "No free slots in inventory, halting.", Console.MessageType.Warning)
+                _log_loot_exit(exit_reason)
                 ActionQueueManager().ResetAllQueues()
                 return
 
@@ -2263,18 +2267,7 @@ def PickUpLoot(index:int , message: SharedMessageStruct):
                     if claimed_item_id:
                         clear_loot_lock(claimed_item_id)
                         claimed_item_id = 0
-                    if exit_reason == "map_invalid":
-                        ConsoleLog(
-                            "PickUp Loot",
-                            "Map is not valid, halting.",
-                            Console.MessageType.Warning,
-                        )
-                    elif exit_reason == "inventory_full":
-                        ConsoleLog(
-                            "PickUp Loot",
-                            "No free slots in inventory, halting.",
-                            Console.MessageType.Warning,
-                        )
+                    _log_loot_exit(exit_reason)
                     ActionQueueManager().ResetAllQueues()
                     return
 
